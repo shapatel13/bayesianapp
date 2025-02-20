@@ -3,11 +3,6 @@ import json
 from agno.agent import Agent
 from agno.models.google import Gemini
 from typing import List, Dict
-import os
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
 
 def initialize_session_state():
     """Initialize session state variables"""
@@ -20,7 +15,9 @@ def initialize_session_state():
                 id="gemini-2.0-flash-exp",
                 api_key='AIzaSyDmcPbEDAEojTomYs7vLKu107fOa7c6500'
             ),
-            markdown=True,read_chat_history=True,add_history_to_messages=True,
+            markdown=True,
+            read_chat_history=True,
+            add_history_to_messages=True,
             description="""You are an expert clinical reasoner using advanced Bayesian thinking to assist physicians with complex medical decision-making. 
             You combine sophisticated probabilistic reasoning with deep medical knowledge to provide precise quantitative assessments in clinical scenarios.""",
             instructions=[
@@ -134,4 +131,4 @@ def main():
     )
 
 if __name__ == "__main__":
-    main() 
+    main()

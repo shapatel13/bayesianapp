@@ -1,4 +1,4 @@
 streamlit>=1.31.0
-agno>=0.1.0
+agno==0.1.0
 google-generativeai>=0.3.0
 rich>=13.0.0

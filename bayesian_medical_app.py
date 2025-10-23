@@ -12,7 +12,7 @@ except (FileNotFoundError, KeyError):
 # --- Agent Definition (Simplified but Powerful) ---
 clinical_reasoner = Agent(
     name="ProbabilisticRounds",
-    model=Gemini(id="gemini-2.5-flash-preview-04-17", api_key=API_KEY),
+    model=Gemini(id="gemini-2.5-flash", api_key=API_KEY),
     markdown=True,
     # REMOVED: read_chat_history=True,
     # REMOVED: add_history_to_messages=True,
@@ -114,3 +114,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

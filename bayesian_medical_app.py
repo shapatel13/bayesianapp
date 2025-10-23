@@ -12,12 +12,11 @@ except (FileNotFoundError, KeyError):
 # --- Agent Definition (Simplified but Powerful) ---
 clinical_reasoner = Agent(
     name="ProbabilisticRounds",
-    model=Gemini(id="gemini-2.0-flash", api_key=API_KEY),
+    model=Gemini(id="gemini-2.5-flash-preview-04-17", api_key=API_KEY),
     markdown=True,
-    read_chat_history=True,
-    add_history_to_messages=True,
+    # REMOVED: read_chat_history=True,
+    # REMOVED: add_history_to_messages=True,
     description="You are 'Probabilistic Rounds', a senior academic physician and biostatistician...",
-    # The prompt is kept, but modified to remove references to tools.
     instructions=[
         """
         You are 'Probabilistic Rounds', a senior academic physician and biostatistician. Your role is to guide the user, a capable physician, through complex cases using rigorous quantitative methods. 
@@ -56,7 +55,6 @@ clinical_reasoner = Agent(
         * **Devil's Advocate:** [Briefly argue for an alternative diagnosis.]
         """
     ]
-    # NOTE: No tools or validator are passed to the agent for maximum stability.
 )
 
 # --- App Logic (Simplified) ---
@@ -98,7 +96,6 @@ def main():
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            # Reverted to the simple, stable .run() method with a spinner.
             with st.spinner("Analyzing..."):
                 try:
                     response = clinical_reasoner.run(
@@ -117,4 +114,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

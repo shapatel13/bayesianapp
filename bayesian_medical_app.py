@@ -484,24 +484,93 @@ class AdvancedDecisionEngine:
     
     def _build_influence_diagram(self, context: ClinicalDecisionContext) -> Dict:
         """
-        Creates an influence diagram structure
+        Creates an enhanced influence diagram structure with clinical context
         """
+        disease_name = context.disease_name or "Disease"
+        
+        nodes = [
+            {
+                'id': 'clinical_findings',
+                'label': 'Clinical Findings\n& History',
+                'type': 'chance',
+                'description': 'Patient presentation, symptoms, risk factors',
+                'value': None
+            },
+            {
+                'id': 'prior',
+                'label': f'Prior Probability\n{disease_name}',
+                'type': 'chance',
+                'description': f'Pre-test probability based on clinical presentation',
+                'value': f'{context.prior_probability:.1%}'
+            },
+            {
+                'id': 'test_decision',
+                'label': 'Test Selection\nDecision',
+                'type': 'decision',
+                'description': 'Which diagnostic test(s) to order',
+                'value': ', '.join(context.test_names[:2]) if context.test_names else 'Tests available'
+            },
+            {
+                'id': 'test_result',
+                'label': 'Test Results',
+                'type': 'chance',
+                'description': 'Positive/negative findings from diagnostic tests',
+                'value': None
+            },
+            {
+                'id': 'posterior',
+                'label': f'Posterior Probability\n{disease_name}',
+                'type': 'chance',
+                'description': 'Updated probability after test results',
+                'value': 'Updated by LRs'
+            },
+            {
+                'id': 'treatment_decision',
+                'label': 'Treatment\nDecision',
+                'type': 'decision',
+                'description': 'Treat, observe, or test further',
+                'value': None
+            },
+            {
+                'id': 'utilities',
+                'label': 'Expected\nUtilities',
+                'type': 'value',
+                'description': 'Benefits and harms of each action',
+                'value': f'Treat: {context.utilities.get("treat_success", 0):.2f} QALYs'
+            },
+            {
+                'id': 'costs',
+                'label': 'Resource\nCosts',
+                'type': 'value',
+                'description': 'Financial and opportunity costs',
+                'value': 'Cost tiers considered'
+            },
+            {
+                'id': 'outcome',
+                'label': 'Patient\nOutcome',
+                'type': 'value',
+                'description': 'Clinical outcome incorporating all factors',
+                'value': 'Maximize QALYs'
+            }
+        ]
+        
+        edges = [
+            {'from': 'clinical_findings', 'to': 'prior', 'label': 'Informs'},
+            {'from': 'prior', 'to': 'test_decision', 'label': 'Guides'},
+            {'from': 'test_decision', 'to': 'test_result', 'label': 'Produces'},
+            {'from': 'test_result', 'to': 'posterior', 'label': 'Updates via LR'},
+            {'from': 'posterior', 'to': 'treatment_decision', 'label': 'Informs'},
+            {'from': 'utilities', 'to': 'treatment_decision', 'label': 'Weighs'},
+            {'from': 'costs', 'to': 'test_decision', 'label': 'Constrains'},
+            {'from': 'costs', 'to': 'treatment_decision', 'label': 'Constrains'},
+            {'from': 'treatment_decision', 'to': 'outcome', 'label': 'Determines'},
+            {'from': 'posterior', 'to': 'outcome', 'label': 'Affects'}
+        ]
+        
         return {
-            'description': 'Causal relationships between clinical factors',
-            'nodes': [
-                {'id': 'prior', 'label': 'Prior Probability', 'type': 'chance'},
-                {'id': 'test', 'label': 'Test Result', 'type': 'chance'},
-                {'id': 'disease', 'label': 'Disease Present', 'type': 'chance'},
-                {'id': 'action', 'label': 'Clinical Action', 'type': 'decision'},
-                {'id': 'outcome', 'label': 'Patient Outcome', 'type': 'value'}
-            ],
-            'edges': [
-                {'from': 'prior', 'to': 'disease'},
-                {'from': 'disease', 'to': 'test'},
-                {'from': 'test', 'to': 'action'},
-                {'from': 'action', 'to': 'outcome'},
-                {'from': 'disease', 'to': 'outcome'}
-            ]
+            'description': f'Complete decision pathway for {disease_name} evaluation',
+            'nodes': nodes,
+            'edges': edges
         }
     
     def _detect_cognitive_biases(self, context: ClinicalDecisionContext) -> List[Dict]:
@@ -659,6 +728,121 @@ def create_sensitivity_tornado(sensitivity: Dict) -> go.Figure:
         xaxis_title="Parameter Value",
         yaxis_title="Parameter",
         height=300
+    )
+    
+    return fig
+
+def create_influence_diagram_viz(influence_diagram: Dict) -> go.Figure:
+    """Create interactive influence diagram visualization"""
+    nodes = influence_diagram['nodes']
+    edges = influence_diagram['edges']
+    
+    # Define positions for nodes (layered layout)
+    positions = {
+        'clinical_findings': (0, 2),
+        'prior': (1, 2),
+        'test_decision': (2, 3),
+        'test_result': (3, 3),
+        'posterior': (4, 2),
+        'utilities': (4, 1),
+        'costs': (2, 0),
+        'treatment_decision': (5, 2),
+        'outcome': (6, 2)
+    }
+    
+    # Color scheme by node type
+    colors = {
+        'chance': '#87CEEB',      # Sky blue for chance nodes
+        'decision': '#90EE90',     # Light green for decision nodes
+        'value': '#FFD700'         # Gold for value nodes
+    }
+    
+    # Create edge traces
+    edge_traces = []
+    for edge in edges:
+        from_pos = positions.get(edge['from'], (0, 0))
+        to_pos = positions.get(edge['to'], (1, 1))
+        
+        edge_trace = go.Scatter(
+            x=[from_pos[0], to_pos[0], None],
+            y=[from_pos[1], to_pos[1], None],
+            mode='lines',
+            line=dict(width=2, color='#888'),
+            hoverinfo='text',
+            text=edge.get('label', ''),
+            showlegend=False
+        )
+        edge_traces.append(edge_trace)
+    
+    # Create node trace
+    node_x = []
+    node_y = []
+    node_text = []
+    node_colors = []
+    node_hover = []
+    
+    for node in nodes:
+        pos = positions.get(node['id'], (0, 0))
+        node_x.append(pos[0])
+        node_y.append(pos[1])
+        node_text.append(node['label'])
+        node_colors.append(colors.get(node['type'], '#CCCCCC'))
+        
+        hover_text = f"<b>{node['label']}</b><br>"
+        hover_text += f"Type: {node['type']}<br>"
+        hover_text += f"{node.get('description', '')}"
+        if node.get('value'):
+            hover_text += f"<br>Value: {node['value']}"
+        node_hover.append(hover_text)
+    
+    node_trace = go.Scatter(
+        x=node_x,
+        y=node_y,
+        mode='markers+text',
+        text=node_text,
+        textposition="middle center",
+        textfont=dict(size=10, color='black'),
+        hoverinfo='text',
+        hovertext=node_hover,
+        marker=dict(
+            size=80,
+            color=node_colors,
+            line=dict(width=2, color='#333')
+        ),
+        showlegend=False
+    )
+    
+    # Create figure
+    fig = go.Figure(data=edge_traces + [node_trace])
+    
+    # Update layout
+    fig.update_layout(
+        title={
+            'text': influence_diagram['description'],
+            'x': 0.5,
+            'xanchor': 'center'
+        },
+        showlegend=False,
+        hovermode='closest',
+        margin=dict(b=20, l=5, r=5, t=60),
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        height=500,
+        plot_bgcolor='white'
+    )
+    
+    # Add legend manually
+    fig.add_annotation(
+        x=0.02, y=0.98,
+        xref='paper', yref='paper',
+        text='<b>Legend:</b><br>🔵 Chance nodes<br>🟢 Decision nodes<br>🟡 Value nodes',
+        showarrow=False,
+        bgcolor='white',
+        bordercolor='black',
+        borderwidth=1,
+        align='left',
+        xanchor='left',
+        yanchor='top'
     )
     
     return fig
@@ -1202,19 +1386,55 @@ def display_analysis_results():
             st.success("✓ No cognitive biases detected")
     
     # Influence Diagram (collapsed by default)
-    with st.expander("🔗 View Influence Diagram"):
-        st.markdown("### Causal Relationship Model")
+    with st.expander("🔗 View Influence Diagram", expanded=False):
+        st.markdown("### Clinical Decision Pathway")
         st.markdown(results.influence_diagram['description'])
         
-        st.markdown("**Nodes:**")
-        for node in results.influence_diagram['nodes']:
-            st.markdown(f"- {node['label']} ({node['type']})")
+        # Interactive visualization
+        fig = create_influence_diagram_viz(results.influence_diagram)
+        st.plotly_chart(fig, use_container_width=True)
         
-        st.markdown("**Relationships:**")
+        # Detailed node information
+        st.markdown("---")
+        st.markdown("### Node Details")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.markdown("**🔵 Chance Nodes** (Uncertain events)")
+            for node in results.influence_diagram['nodes']:
+                if node['type'] == 'chance':
+                    st.markdown(f"- **{node['label'].replace(chr(10), ' ')}**")
+                    st.caption(node.get('description', ''))
+                    if node.get('value'):
+                        st.caption(f"*{node['value']}*")
+        
+        with col2:
+            st.markdown("**🟢 Decision Nodes** (Actions to take)")
+            for node in results.influence_diagram['nodes']:
+                if node['type'] == 'decision':
+                    st.markdown(f"- **{node['label'].replace(chr(10), ' ')}**")
+                    st.caption(node.get('description', ''))
+                    if node.get('value'):
+                        st.caption(f"*{node['value']}*")
+        
+        with col3:
+            st.markdown("**🟡 Value Nodes** (Outcomes & utilities)")
+            for node in results.influence_diagram['nodes']:
+                if node['type'] == 'value':
+                    st.markdown(f"- **{node['label'].replace(chr(10), ' ')}**")
+                    st.caption(node.get('description', ''))
+                    if node.get('value'):
+                        st.caption(f"*{node['value']}*")
+        
+        st.markdown("---")
+        st.markdown("### Key Decision Pathways")
         for edge in results.influence_diagram['edges']:
             from_node = next(n['label'] for n in results.influence_diagram['nodes'] if n['id'] == edge['from'])
             to_node = next(n['label'] for n in results.influence_diagram['nodes'] if n['id'] == edge['to'])
-            st.markdown(f"- {from_node} → {to_node}")
+            label = edge.get('label', '')
+            st.markdown(f"- {from_node.replace(chr(10), ' ')} **{label}** → {to_node.replace(chr(10), ' ')}")
+    
     
     # Show full mathematics
     with st.expander("🧮 View Full Mathematical Details"):

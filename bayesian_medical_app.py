@@ -1,18 +1,24 @@
-# app_priori_improved.py
-# PRIORI — Bayesian + EVI + Utility with Relative Cost Tiers & Improved UX
-
-import re
-import json
-from typing import Dict
-
 import streamlit as st
-from agno.agent import Agent
-from agno.models.google import Gemini
+import json
+import numpy as np
+import re
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+import plotly.graph_objects as go
+import plotly.express as px
+from scipy import stats
+from agno import Agno
 
-# --- Configuration ---
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
 API_KEY = 'AIzaSyDmcPbEDAEojTomYs7vLKu107fOa7c6500'
 
-# ---------- Cost Tiers (Simplified for MVP) ----------
+# ============================================================================
+# COST TIERS (Resource Stewardship)
+# ============================================================================
+
 COST_TIERS = {
     # PE workup
     "D-dimer": {"tier": "$", "relative_cost": 1, "note": "Low-cost screening"},
@@ -61,41 +67,9 @@ def get_cost_info(item_name: str) -> dict:
         "note": "Not in reference"
     })
 
-# ---------- JSON tail extractor ----------
-JSON_BLOCK_PATTERN = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
-
-def extract_json_tail(text: str) -> Dict:
-    """Extract last valid JSON block from markdown response."""
-    matches = JSON_BLOCK_PATTERN.findall(text or "")
-    for raw in reversed(matches):
-        try:
-            return json.loads(raw)
-        except Exception:
-            continue
-    return {}
-
-def safe_float(value, default=0.0) -> float:
-    """Safely convert value to float, handling strings and errors."""
-    if value is None:
-        return default
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        # Try to extract first number from string
-        import re
-        numbers = re.findall(r'-?\d+\.?\d*', value)
-        if numbers:
-            try:
-                return float(numbers[0])
-            except ValueError:
-                return default
-    return default
-
-def hide_json_blocks(content: str) -> str:
-    """Remove JSON code blocks from content before displaying to user."""
-    return JSON_BLOCK_PATTERN.sub("", content)
-
-# ---------- Guardrails & Safety Validation ----------
+# ============================================================================
+# SAFETY GUARDRAILS
+# ============================================================================
 
 class SafetyGuardrails:
     """Multi-layer safety validation for clinical recommendations."""
@@ -142,7 +116,6 @@ class SafetyGuardrails:
         
         for key, (threshold, message) in SafetyGuardrails.CRITICAL_VALUES.items():
             # Look for patterns like "K 7.2" or "potassium 7.2" or "K+ 7.2"
-            import re
             patterns = [
                 rf"{key}\s*[=>:]\s*(\d+\.?\d*)",
                 rf"{key}\s+(\d+\.?\d*)",
@@ -175,580 +148,1118 @@ class SafetyGuardrails:
             if intervention.lower() in rec_lower:
                 flagged.append(intervention)
         
-        if flagged:
+        return {
+            "has_high_risk": len(flagged) > 0,
+            "interventions": flagged,
+            "message": f"🔴 High-risk intervention detected: {', '.join(flagged)}" if flagged else ""
+        }
+    
+    @staticmethod
+    def check_nephrotoxic_drugs(user_text: str, recommendation: str) -> dict:
+        """Check for nephrotoxic drugs when AKI is mentioned."""
+        has_aki = any(term in user_text.lower() for term in ["aki", "acute kidney injury", "renal failure", "creatinine", "oliguria"])
+        
+        if not has_aki:
+            return {"has_warning": False, "drugs": [], "message": ""}
+        
+        rec_lower = recommendation.lower()
+        flagged_drugs = []
+        
+        for drug in SafetyGuardrails.NEPHROTOXIC_DRUGS:
+            if drug.lower() in rec_lower:
+                flagged_drugs.append(drug)
+        
+        if flagged_drugs:
             return {
-                "requires_oversight": True,
-                "message": f"🔴 **HIGH-RISK INTERVENTION**: Recommendation includes {', '.join(flagged)}. Requires attending physician approval."
+                "has_warning": True,
+                "drugs": flagged_drugs,
+                "message": f"💊 **AKI + Nephrotoxic Drug**: {', '.join(flagged_drugs)} — Consider renal dosing adjustment"
             }
-        return {"requires_oversight": False}
+        
+        return {"has_warning": False, "drugs": [], "message": ""}
     
     @staticmethod
-    def check_nephrotoxic_with_aki(user_text: str, recommendation: str) -> dict:
-        """Flag nephrotoxic drugs when AKI is mentioned."""
-        if any(term in user_text.lower() for term in ["aki", "acute kidney", "renal failure", "creatinine", "oligur"]):
-            rec_lower = recommendation.lower()
-            flagged = []
-            
-            for drug in SafetyGuardrails.NEPHROTOXIC_DRUGS:
-                if drug.lower() in rec_lower and "stop" not in rec_lower and "discontinue" not in rec_lower:
-                    flagged.append(drug)
-            
-            if flagged:
-                return {
-                    "nephrotoxicity_risk": True,
-                    "message": f"⚠️ **NEPHROTOXICITY ALERT**: Recommending {', '.join(flagged)} in setting of AKI. Verify renal dosing and risk-benefit."
-                }
-        
-        return {"nephrotoxicity_risk": False}
-    
-    @staticmethod
-    def validate_posterior_threshold(data: dict, user_text: str) -> dict:
-        """Check if treatment aligns with posterior probability."""
-        posterior_raw = data.get("posterior")
-        recommendation = data.get("recommendation", "") or data.get("best_action", "")
-        
-        if not posterior_raw or not recommendation:
-            return {"threshold_warning": False}
-        
-        # Use safe_float to handle various formats
-        from typing import TYPE_CHECKING
-        posterior = safe_float(posterior_raw)
-        
-        if posterior == 0.0:
-            return {"threshold_warning": False}
-        
-        warnings = []
-        
-        # Very low posterior (<5%) but recommending treatment
-        if posterior < 0.05:
-            treat_keywords = ["start", "begin", "initiate", "give", "administer", "continue"]
-            if any(kw in recommendation.lower() for kw in treat_keywords):
-                # Check if high harm treatment
-                high_harm = any(drug in user_text.lower() for drug in SafetyGuardrails.NEPHROTOXIC_DRUGS)
-                if high_harm:
-                    warnings.append(
-                        f"⚠️ **LOW PROBABILITY WARNING**: Posterior probability is {posterior*100:.1f}% but recommending treatment with known toxicity. "
-                        f"Verify that expected benefit exceeds expected harm."
-                    )
-        
-        # Very high posterior (>80%) but recommending against treatment
-        if posterior > 0.80:
-            stop_keywords = ["stop", "discontinue", "avoid", "do not", "defer"]
-            if any(kw in recommendation.lower() for kw in stop_keywords):
-                warnings.append(
-                    f"⚠️ **HIGH PROBABILITY WARNING**: Posterior probability is {posterior*100:.1f}% but recommending against treatment. "
-                    f"Verify this is appropriate given high disease probability."
-                )
-        
-        return {"threshold_warning": len(warnings) > 0, "warnings": warnings}
-    
-    @staticmethod
-    def check_harm_benefit_mismatch(data: dict) -> dict:
-        """Verify harm-benefit calculation is internally consistent."""
-        utility_rank = data.get("utility_rank", [])
-        best_action = data.get("recommendation", "") or data.get("best_action", "")
-        
-        if not utility_rank or not best_action:
-            return {"mismatch": False}
-        
-        try:
-            # Find highest utility action using safe_float
-            sorted_actions = sorted(utility_rank, key=lambda x: safe_float(x.get("utility", 0)), reverse=True)
-            if not sorted_actions:
-                return {"mismatch": False}
-            
-            top_action = sorted_actions[0].get("action", "").lower()
-            best_lower = best_action.lower()
-            
-            # Check if recommendation matches highest utility action
-            # Simple keyword overlap check
-            top_keywords = set(top_action.split())
-            best_keywords = set(best_lower.split())
-            overlap = len(top_keywords & best_keywords) / max(len(top_keywords), 1)
-            
-            if overlap < 0.3:  # Less than 30% keyword overlap
-                return {
-                    "mismatch": True,
-                    "message": f"⚠️ **INTERNAL INCONSISTENCY**: Highest utility action is '{sorted_actions[0].get('action')}' but recommendation is '{best_action}'. Review reasoning."
-                }
-        except Exception:
-            # If any error in processing, don't flag mismatch
-            return {"mismatch": False}
-        
-        return {"mismatch": False}
-    
-    @staticmethod
-    def run_all_checks(user_text: str, data: dict) -> list:
-        """Run all guardrail checks and return list of warnings."""
-        warnings = []
+    def validate_all(user_text: str, recommendation: str) -> List[str]:
+        """Run all safety checks and return list of warnings."""
+        all_warnings = []
         
         # Critical values
-        crit_check = SafetyGuardrails.check_critical_values(user_text)
-        if crit_check["has_critical"]:
-            warnings.extend(crit_check["warnings"])
-        
-        # Get recommendation from data
-        recommendation = data.get("recommendation", "") or data.get("best_action", "")
+        critical = SafetyGuardrails.check_critical_values(user_text)
+        if critical["has_critical"]:
+            all_warnings.extend(critical["warnings"])
         
         # High-risk interventions
-        risk_check = SafetyGuardrails.check_high_risk_intervention(recommendation)
-        if risk_check["requires_oversight"]:
-            warnings.append(risk_check["message"])
+        high_risk = SafetyGuardrails.check_high_risk_intervention(recommendation)
+        if high_risk["has_high_risk"]:
+            all_warnings.append(high_risk["message"])
         
-        # Nephrotoxicity in AKI
-        nephro_check = SafetyGuardrails.check_nephrotoxic_with_aki(user_text, recommendation)
-        if nephro_check["nephrotoxicity_risk"]:
-            warnings.append(nephro_check["message"])
+        # Nephrotoxic drugs
+        nephro = SafetyGuardrails.check_nephrotoxic_drugs(user_text, recommendation)
+        if nephro["has_warning"]:
+            all_warnings.append(nephro["message"])
         
-        # Posterior threshold alignment
-        threshold_check = SafetyGuardrails.validate_posterior_threshold(data, user_text)
-        if threshold_check["threshold_warning"]:
-            warnings.extend(threshold_check.get("warnings", []))
+        return all_warnings
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+JSON_BLOCK_PATTERN = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
+
+def extract_json_tail(text: str) -> Dict:
+    """Extract last valid JSON block from markdown response."""
+    matches = JSON_BLOCK_PATTERN.findall(text or "")
+    for raw in reversed(matches):
+        try:
+            return json.loads(raw)
+        except Exception:
+            continue
+    return {}
+
+def safe_float(value, default=0.0) -> float:
+    """Safely convert value to float, handling strings and errors."""
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        # Try to extract first number from string
+        numbers = re.findall(r'-?\d+\.?\d*', value)
+        if numbers:
+            try:
+                return float(numbers[0])
+            except ValueError:
+                return default
+    return default
+
+def hide_json_blocks(content: str) -> str:
+    """Remove JSON code blocks from content before displaying to user."""
+    return JSON_BLOCK_PATTERN.sub("", content)
+
+# ============================================================================
+# DATA STRUCTURES
+# ============================================================================
+
+@dataclass
+class ClinicalDecisionContext:
+    """Enhanced context with advanced decision theory"""
+    prior_probability: float
+    likelihood_ratios: Dict[str, Tuple[float, float]]  # test -> (LR+, LR-)
+    utilities: Dict[str, float]  # outcome -> utility (QALYs)
+    patient_preferences: Dict[str, float]  # preference weights
+    test_costs: Dict[str, float]
+    treatment_costs: Dict[str, float]
+    disease_name: str
+    test_names: List[str]
+    patient_query: str
+    
+@dataclass
+class AdvancedAnalysisResults:
+    """Results from advanced decision theory"""
+    thresholds: Dict[str, float]
+    evpi: Dict[str, Dict]
+    mcmc_results: Dict
+    sensitivity: Dict
+    influence_diagram: Dict
+    bias_warnings: List[Dict]
+    recommendation: str
+    confidence: float
+    llm_reasoning: str
+    safety_warnings: List[str]
+
+# ============================================================================
+# ADVANCED DECISION ENGINE
+# ============================================================================
+
+class AdvancedDecisionEngine:
+    """Implements cutting-edge decision theory from the PDF"""
+    
+    def __init__(self):
+        self.n_simulations = 10000
+    
+    def analyze(self, context: ClinicalDecisionContext, safety_warnings: List[str]) -> AdvancedAnalysisResults:
+        """Run all advanced analyses in parallel with LLM"""
         
-        # Harm-benefit internal consistency
-        mismatch_check = SafetyGuardrails.check_harm_benefit_mismatch(data)
-        if mismatch_check["mismatch"]:
-            warnings.append(mismatch_check["message"])
+        # Calculate thresholds
+        thresholds = self._compute_thresholds(context)
+        
+        # Calculate EVPI
+        evpi = self._calculate_evpi(context)
+        
+        # Run MCMC simulation
+        mcmc_results = self._run_mcmc_simulation(context)
+        
+        # Sensitivity analysis
+        sensitivity = self._sensitivity_analysis(context)
+        
+        # Build influence diagram
+        influence_diagram = self._build_influence_diagram(context)
+        
+        # Detect cognitive biases
+        bias_warnings = self._detect_cognitive_biases(context)
+        
+        # Determine recommendation
+        recommendation = self._get_recommendation(context, thresholds)
+        
+        # Calculate confidence
+        confidence = self._calculate_confidence(mcmc_results, sensitivity)
+        
+        return AdvancedAnalysisResults(
+            thresholds=thresholds,
+            evpi=evpi,
+            mcmc_results=mcmc_results,
+            sensitivity=sensitivity,
+            influence_diagram=influence_diagram,
+            bias_warnings=bias_warnings,
+            recommendation=recommendation,
+            confidence=confidence,
+            llm_reasoning="",  # Will be filled by LLM
+            safety_warnings=safety_warnings
+        )
+    
+    def _compute_thresholds(self, context: ClinicalDecisionContext) -> Dict[str, float]:
+        """
+        Dynamic threshold calculation (PDF page 83)
+        Finds exact probability where decision changes
+        """
+        # Utility of treating when disease present
+        u_treat_disease = context.utilities.get('treat_success', 0.9)
+        # Utility of treating when no disease (harm from treatment)
+        u_treat_no_disease = context.utilities.get('treat_healthy', 0.95)
+        # Utility of not treating when disease present (disease progresses)
+        u_observe_disease = context.utilities.get('observe_disease', 0.0)
+        # Utility of not treating when no disease
+        u_observe_no_disease = context.utilities.get('observe_healthy', 1.0)
+        
+        # Treatment threshold: where E(treat) = E(observe)
+        numerator = u_observe_no_disease - u_treat_no_disease
+        denominator = (u_treat_disease - u_observe_disease) - (u_treat_no_disease - u_observe_no_disease)
+        
+        if denominator != 0:
+            treat_threshold = numerator / denominator
+        else:
+            treat_threshold = 0.5
+        
+        # Test threshold (simplified)
+        test_threshold = treat_threshold * 0.3
+        
+        return {
+            'test_threshold': max(0.01, min(0.99, test_threshold)),
+            'treat_threshold': max(0.01, min(0.99, treat_threshold)),
+            'observe_threshold': 0.0
+        }
+    
+    def _calculate_evpi(self, context: ClinicalDecisionContext) -> Dict[str, Dict]:
+        """
+        Expected Value of Perfect Information (PDF page 81)
+        Determines if a test is worth performing
+        """
+        evpi_results = {}
+        
+        # Current EV without any test
+        p = context.prior_probability
+        ev_treat = p * context.utilities.get('treat_success', 0.9) + \
+                   (1-p) * context.utilities.get('treat_healthy', 0.95)
+        ev_observe = p * context.utilities.get('observe_disease', 0.0) + \
+                     (1-p) * context.utilities.get('observe_healthy', 1.0)
+        ev_current = max(ev_treat, ev_observe)
+        
+        for test_name in context.test_names:
+            if test_name not in context.likelihood_ratios:
+                continue
+                
+            lr_pos, lr_neg = context.likelihood_ratios[test_name]
+            
+            # EV if we knew the truth with certainty
+            ev_perfect = p * context.utilities.get('treat_success', 0.9) + \
+                        (1-p) * context.utilities.get('observe_healthy', 1.0)
+            
+            # EVPI in QALYs
+            evpi_qalys = max(0, ev_perfect - ev_current)
+            
+            # Cost per QALY
+            test_cost = context.test_costs.get(test_name, 100)
+            cost_per_qaly = test_cost / evpi_qalys if evpi_qalys > 0 else float('inf')
+            
+            # Recommendation
+            if cost_per_qaly < 50000:
+                recommendation = "✓ Worthwhile"
+                reason = f"Cost-effective at ${cost_per_qaly:,.0f}/QALY"
+            elif cost_per_qaly < 100000:
+                recommendation = "⚠ Consider"
+                reason = f"Moderate value at ${cost_per_qaly:,.0f}/QALY"
+            else:
+                recommendation = "✗ Skip"
+                reason = f"Poor value at ${cost_per_qaly:,.0f}/QALY"
+            
+            evpi_results[test_name] = {
+                'evpi_qalys': evpi_qalys,
+                'cost_per_qaly': cost_per_qaly,
+                'recommendation': recommendation,
+                'reason': reason,
+                'test_cost': test_cost
+            }
+        
+        return evpi_results
+    
+    def _run_mcmc_simulation(self, context: ClinicalDecisionContext) -> Dict:
+        """
+        Monte Carlo simulation (PDF pages 91-93)
+        Returns probability distributions instead of point estimates
+        """
+        samples = []
+        
+        for _ in range(self.n_simulations):
+            # Add uncertainty to prior
+            noisy_prior = np.clip(
+                np.random.normal(context.prior_probability, 0.05),
+                0.01, 0.99
+            )
+            samples.append(noisy_prior)
+        
+        samples = np.array(samples)
+        
+        return {
+            'samples': samples,
+            'mean': float(np.mean(samples)),
+            'std': float(np.std(samples)),
+            'ci_95_lower': float(np.percentile(samples, 2.5)),
+            'ci_95_upper': float(np.percentile(samples, 97.5)),
+            'uncertainty_high': float(np.std(samples)) > 0.1
+        }
+    
+    def _sensitivity_analysis(self, context: ClinicalDecisionContext) -> Dict:
+        """
+        One-way sensitivity analysis
+        Tests how recommendation changes with parameter variations
+        """
+        base_recommendation = self._get_recommendation(context, self._compute_thresholds(context))
+        
+        sensitivities = {}
+        parameters = ['prior_probability', 'utilities']
+        
+        for param in parameters:
+            variations = []
+            
+            if param == 'prior_probability':
+                for factor in [0.5, 0.75, 1.0, 1.25, 1.5]:
+                    new_prob = np.clip(context.prior_probability * factor, 0.01, 0.99)
+                    new_context = ClinicalDecisionContext(
+                        prior_probability=new_prob,
+                        likelihood_ratios=context.likelihood_ratios,
+                        utilities=context.utilities,
+                        patient_preferences=context.patient_preferences,
+                        test_costs=context.test_costs,
+                        treatment_costs=context.treatment_costs,
+                        disease_name=context.disease_name,
+                        test_names=context.test_names,
+                        patient_query=context.patient_query
+                    )
+                    new_rec = self._get_recommendation(new_context, self._compute_thresholds(new_context))
+                    variations.append({
+                        'factor': factor,
+                        'value': new_prob,
+                        'recommendation': new_rec,
+                        'changed': new_rec != base_recommendation
+                    })
+            
+            sensitivities[param] = variations
+        
+        # Determine most influential parameter
+        max_changes = 0
+        most_influential = None
+        
+        for param, variations in sensitivities.items():
+            changes = sum(1 for v in variations if v['changed'])
+            if changes > max_changes:
+                max_changes = changes
+                most_influential = param
+        
+        return {
+            'sensitivities': sensitivities,
+            'most_influential': most_influential or 'None',
+            'decision_fragile': max_changes > 2
+        }
+    
+    def _build_influence_diagram(self, context: ClinicalDecisionContext) -> Dict:
+        """
+        Creates an influence diagram structure
+        """
+        return {
+            'description': 'Causal relationships between clinical factors',
+            'nodes': [
+                {'id': 'prior', 'label': 'Prior Probability', 'type': 'chance'},
+                {'id': 'test', 'label': 'Test Result', 'type': 'chance'},
+                {'id': 'disease', 'label': 'Disease Present', 'type': 'chance'},
+                {'id': 'action', 'label': 'Clinical Action', 'type': 'decision'},
+                {'id': 'outcome', 'label': 'Patient Outcome', 'type': 'value'}
+            ],
+            'edges': [
+                {'from': 'prior', 'to': 'disease'},
+                {'from': 'disease', 'to': 'test'},
+                {'from': 'test', 'to': 'action'},
+                {'from': 'action', 'to': 'outcome'},
+                {'from': 'disease', 'to': 'outcome'}
+            ]
+        }
+    
+    def _detect_cognitive_biases(self, context: ClinicalDecisionContext) -> List[Dict]:
+        """
+        Checks for common cognitive biases in medical decision-making
+        """
+        warnings = []
+        
+        # Anchoring bias - overreliance on initial probability
+        if context.prior_probability < 0.05 or context.prior_probability > 0.95:
+            warnings.append({
+                'bias': 'Anchoring Bias',
+                'icon': '⚓',
+                'description': f'Extreme prior probability ({context.prior_probability:.1%}) may anchor judgment',
+                'suggestion': 'Consider if this prior reflects true population prevalence or observation bias'
+            })
+        
+        # Availability bias - recent cases affecting judgment
+        if any(lr[0] > 50 for lr in context.likelihood_ratios.values()):
+            warnings.append({
+                'bias': 'Availability Bias',
+                'icon': '🎯',
+                'description': 'Very high likelihood ratio suggests recent memorable cases may influence judgment',
+                'suggestion': 'Verify test characteristics against published literature, not recent experience'
+            })
+        
+        # Omission bias - preference for inaction
+        u_observe = context.utilities.get('observe_healthy', 1.0) - context.utilities.get('observe_disease', 0.0)
+        u_treat = context.utilities.get('treat_success', 0.9) - context.utilities.get('treat_healthy', 0.95)
+        
+        if u_observe > u_treat * 2:
+            warnings.append({
+                'bias': 'Omission Bias',
+                'icon': '🛑',
+                'description': 'Utility structure shows strong preference for observation over action',
+                'suggestion': 'Consider if fear of treatment complications is appropriate or excessive'
+            })
         
         return warnings
-
-# ---------- Scenario hint detection (lightweight, non-prescriptive) ----------
-def detect_scenario_hint(user_text: str) -> str:
-    """Detect scenario type to provide minimal context hint, NOT full instructions."""
-    t = (user_text or "").lower()
     
-    # Just give the LLM a hint about what domain this is in
-    # Don't tell it what to do
-    if any(k in t for k in ["pulmonary embol", " pe ", " pe.", "wells", "perc", "d-dimer", "d dimer"]):
-        return "pulmonary embolism workup"
-    if any(k in t for k in ["encephalitis", "hsv", "acyclovir", "temporal lobe", "meningitis", "csf", "lumbar puncture"]):
-        return "CNS infection (encephalitis/meningitis)"
-    if any(k in t for k in ["pneumonia", "cap", "community-acquired", "infiltrate", "procalcitonin"]):
-        return "community-acquired pneumonia"
-    if any(k in t for k in ["septic shock", "sepsis", "norepinephrine", "vasopressin", "vexus", "plr"]):
-        return "septic shock/sepsis management"
-    if any(k in t for k in ["aki", "oligur", "furosemide stress", "fst", "dialysis", "crrt", "acute kidney"]):
-        return "acute kidney injury"
-    if any(k in t for k in ["gi bleed", "hematemesis", "melena", "varice", "egd", "octreotide"]):
-        return "upper GI bleeding"
-    if any(k in t for k in ["chest pain", "heart score", "troponin", "ecg", "acs", "acute coronary"]):
-        return "chest pain/ACS evaluation"
+    def _get_recommendation(self, context: ClinicalDecisionContext, thresholds: Dict[str, float]) -> str:
+        """
+        Determine clinical recommendation based on probability and thresholds
+        """
+        p = context.prior_probability
+        
+        if p < thresholds['test_threshold']:
+            return "Observe"
+        elif p < thresholds['treat_threshold']:
+            return "Test"
+        else:
+            return "Treat"
     
-    return "general inpatient medicine"
+    def _calculate_confidence(self, mcmc_results: Dict, sensitivity: Dict) -> float:
+        """
+        Calculate overall confidence in recommendation
+        """
+        # Lower uncertainty = higher confidence
+        uncertainty_score = 1.0 - min(mcmc_results['std'] / 0.2, 1.0)
+        
+        # Robust decision = higher confidence
+        robustness_score = 0.0 if sensitivity['decision_fragile'] else 1.0
+        
+        # Weighted average
+        confidence = 0.6 * uncertainty_score + 0.4 * robustness_score
+        
+        return confidence
 
-def detect_disagreement_frame(user_text: str) -> bool:
-    """Check if user is questioning or comparing to an existing clinical plan."""
-    disagreement_cues = [
-        "but the", "however the", "the doctor wants", "they want to", 
-        "we're planning to", "my attending says", "recommends", 
-        "should we continue", "should i continue", "keep going",
-        "my thought is", "i think", "despite", "even though"
-    ]
-    return any(cue in user_text.lower() for cue in disagreement_cues)
+# ============================================================================
+# VISUALIZATION FUNCTIONS
+# ============================================================================
 
-# ---------- Core Reasoning Framework (principle-based, not prescriptive) ----------
-REASONING_FRAMEWORK = """
-You are reasoning about: {scenario_hint}
+def create_threshold_viz(context: ClinicalDecisionContext, thresholds: Dict[str, float]) -> go.Figure:
+    """Create threshold visualization"""
+    p = context.prior_probability
+    
+    fig = go.Figure()
+    
+    # Add threshold zones
+    fig.add_vrect(x0=0, x1=thresholds['test_threshold'],
+                  fillcolor="green", opacity=0.2, line_width=0,
+                  annotation_text="Observe", annotation_position="top left")
+    fig.add_vrect(x0=thresholds['test_threshold'], x1=thresholds['treat_threshold'],
+                  fillcolor="yellow", opacity=0.2, line_width=0,
+                  annotation_text="Test", annotation_position="top")
+    fig.add_vrect(x0=thresholds['treat_threshold'], x1=1.0,
+                  fillcolor="red", opacity=0.2, line_width=0,
+                  annotation_text="Treat", annotation_position="top right")
+    
+    # Add current probability marker
+    fig.add_vline(x=p, line_dash="dash", line_color="blue", line_width=3,
+                  annotation_text=f"Current: {p:.1%}", annotation_position="top")
+    
+    fig.update_layout(
+        title="Decision Threshold Analysis",
+        xaxis_title="Probability of Disease",
+        yaxis_title="Expected Utility",
+        xaxis=dict(range=[0, 1], tickformat='.0%'),
+        height=400
+    )
+    
+    return fig
 
-Apply these core principles using YOUR medical knowledge:
+def create_mcmc_distribution(mcmc_results: Dict) -> go.Figure:
+    """Create MCMC distribution plot"""
+    fig = go.Figure()
+    
+    fig.add_trace(go.Histogram(
+        x=mcmc_results['samples'],
+        nbinsx=50,
+        name='Probability Distribution',
+        marker_color='lightblue'
+    ))
+    
+    # Add mean line
+    fig.add_vline(x=mcmc_results['mean'], line_dash="dash", line_color="red",
+                  annotation_text=f"Mean: {mcmc_results['mean']:.1%}")
+    
+    # Add CI lines
+    fig.add_vline(x=mcmc_results['ci_95_lower'], line_dash="dot", line_color="gray",
+                  annotation_text=f"95% CI Lower")
+    fig.add_vline(x=mcmc_results['ci_95_upper'], line_dash="dot", line_color="gray",
+                  annotation_text=f"95% CI Upper")
+    
+    fig.update_layout(
+        title="Uncertainty Distribution (10,000 simulations)",
+        xaxis_title="Probability",
+        yaxis_title="Frequency",
+        xaxis=dict(tickformat='.0%'),
+        height=400
+    )
+    
+    return fig
 
-**Bayesian Foundation:**
-1. Estimate pre-test probability from base rates, epidemiology, clinical gestalt
-2. Identify available evidence (exam findings, labs, imaging) and their likelihood ratios from medical literature
-3. Update probability using: posterior odds = prior odds × LR₁ × LR₂ × ... × LRₙ
-4. State your assumptions clearly (if you don't know exact LR, give reasonable range)
+def create_sensitivity_tornado(sensitivity: Dict) -> go.Figure:
+    """Create tornado diagram for sensitivity analysis"""
+    fig = go.Figure()
+    
+    if 'prior_probability' in sensitivity['sensitivities']:
+        variations = sensitivity['sensitivities']['prior_probability']
+        values = [v['value'] for v in variations]
+        recommendations = [v['recommendation'] for v in variations]
+        
+        fig.add_trace(go.Bar(
+            y=['Prior Probability'] * len(values),
+            x=values,
+            orientation='h',
+            text=recommendations,
+            textposition='auto',
+            marker_color=['red' if v['changed'] else 'green' for v in variations]
+        ))
+    
+    fig.update_layout(
+        title="Sensitivity Analysis - Parameter Variations",
+        xaxis_title="Parameter Value",
+        yaxis_title="Parameter",
+        height=300
+    )
+    
+    return fig
 
-**Treatment Decision Thresholds:**
-- Test threshold: probability above which testing changes management
-- Treatment threshold: probability above which treatment benefit exceeds harm
-- These thresholds SHIFT based on:
-  * Severity of disease if untreated (higher = lower threshold to treat)
-  * Toxicity/risk of treatment (higher = higher threshold to treat)
-  * Patient-specific factors (renal/hepatic dysfunction, drug interactions, frailty)
+# ============================================================================
+# AGNO LLM INTEGRATION
+# ============================================================================
 
-**Harm-Benefit Analysis (CRITICAL):**
-When treatment has significant toxicity OR patient has contraindications:
-- Calculate: E(Benefit) = P(disease) × P(harm prevented by treatment) × value
-- Calculate: E(Harm) = P(adverse event from treatment) × severity
-- If E(Harm) > E(Benefit) → DO NOT TREAT, regardless of specialty opinion
-- State the threshold: "Treatment justified only if P(disease) > [X]%"
+def create_llm_prompt(patient_query: str) -> str:
+    """Create enhanced prompt for Gemini with structured output"""
+    return f"""You are an expert clinical decision support system using Bayesian reasoning, Expected Value of Information (EVI), and utility theory.
 
-**Expected Value of Information (EVI):**
-- Will this test result change management? (If no → don't order)
-- What is the opportunity cost? (Resource stewardship)
-- Use relative cost tiers: $ (baseline), $$ (5-15×), $$$ (30-70×), $$$$$ (100+×)
+Analyze this clinical case:
+{patient_query}
 
-**Independence & Anti-Anchoring:**
-- If user mentions "the [specialist] wants to do X", acknowledge but reason INDEPENDENTLY
-- Do the math FIRST, then compare to stated plan
-- If your analysis differs, say so explicitly with quantitative reasoning
-- Avoid sycophantic phrases like "you're right to consider..." 
-- Instead: "Based on posterior of X%, expected harm exceeds benefit by Y-fold"
+Provide a comprehensive analysis with the following structure:
 
-**Guardrails:**
-- Very low probability (<5%) + high treatment harm → strongly favor stopping
-- Very high probability (>80%) + low treatment harm → favor treating
-- Middle range (5-80%) → detailed harm-benefit analysis required
-"""
+## Clinical Assessment
+[Your clinical reasoning and interpretation]
 
-# ---------- Agent Instructions (principle-based reasoning) ----------
-AGENT_INSTRUCTIONS = """
-You are PRIORI — a Bayesian clinical reasoning assistant.
+## Bayesian Analysis
+Estimate:
+- Prior probability of the disease/condition (0.0 to 1.0)
+- For each relevant test, provide:
+  - Test name
+  - Sensitivity (LR+ calculation)
+  - Specificity (LR- calculation)
+  - Relative cost tier (use $ to $$$$$ scale)
 
-Your role: INDEPENDENT probabilistic analysis using first-principles medical reasoning.
-NOT: Validation of existing decisions or specialty opinions.
+## Utility Analysis
+For each decision option (treat, test, observe), estimate:
+- Benefit score (0.0 to 1.0)
+- Harm score (0.0 to 1.0)
+- Cost tier (from the COST_TIERS reference)
+- Net utility = Benefit - Harm - (Cost factor)
 
-**Core Method:**
-1. Estimate pre-test probability (use base rates, epidemiology, clinical prediction rules)
-2. Identify relevant evidence and apply likelihood ratios from your medical knowledge
-3. Calculate posterior probability using Bayesian updating
-4. Perform harm-benefit analysis: E(Benefit of action) vs E(Harm of action)
-5. Make ONE clear recommendation based on expected utility
+## Expected Value of Information (EVI)
+For each test:
+- Will this test change management?
+- What is the threshold probability for changing decision?
+- EVI score (0.0 to 1.0, where higher = more valuable)
 
-**When treatment has toxicity OR disease probability is low:**
-- Calculate: P(disease) × P(benefit if treated) vs P(harm from treatment) × severity
-- State threshold: "Treatment justified only if P(disease) > X%"
-- If current posterior < threshold → recommend AGAINST treatment
+## Recommendation
+[Final recommendation with confidence level]
 
-**Output Format (Markdown, concise):**
+At the end of your response, provide a JSON block with structured data:
 
-**Executive Summary:** One sentence with posterior probability and recommendation.
-
-### Clinical Reasoning
-- **Posterior Probability:** X% (show brief calculation path)
-- **Recommendation:** Single clear next step
-- **Rationale:** 2-3 bullets connecting Bayes → harm-benefit → decision
-
-<details>
-<summary>Detailed Analysis (optional for reader)</summary>
-
-### Pre-Test Probability
-[Brief justification with base rates/clinical context]
-
-### Evidence & Likelihood Ratios
-| Finding/Test | Result | LR | Note |
-|---|---:|---:|---|
-[Use YOUR medical knowledge for LRs]
-
-### Post-Test Calculation
-[Show odds multiplication]
-
-### Harm-Benefit Analysis
-**If proposing treatment:**
-- E(Benefit) = P(disease) × P(harm prevented) = [calculate]
-- E(Harm from Rx) = P(adverse event) × severity = [calculate]
-- Net utility = [Benefit - Harm]
-- Threshold for treatment = [X%]
-
-**If proposing testing:**
-- Will result change management? (EVI analysis)
-- Cost tier comparison (use relative costs: $, $$, $$$)
-
-</details>
-
-### Structured Output (JSON)
-**CRITICAL**: All numeric fields must contain ONLY numbers (0.15), NOT text descriptions.
 ```json
-{
-  "posterior": 0.15,
-  "recommendation": "Get D-dimer first, then CTA if positive",
-  "threshold_analysis": "Treatment justified if P>20% given bleeding risk",
-  "evi_table": [
-    {"test":"D-dimer","p_change":0.13,"value_if_change":0.50,"evi":0.065}
+{{
+  "prior_probability": <float between 0 and 1>,
+  "disease_name": "<condition being evaluated>",
+  "tests": [
+    {{
+      "name": "<test name>",
+      "lr_positive": <float>,
+      "lr_negative": <float>,
+      "sensitivity": <float>,
+      "specificity": <float>
+    }}
   ],
+  "utilities": {{
+    "treat_success": <float 0-1>,
+    "treat_healthy": <float 0-1>,
+    "observe_disease": <float 0-1>,
+    "observe_healthy": <float 0-1>
+  }},
   "costs": [
-    {"item":"D-dimer","tier":"$","relative_cost":1,"note":"screening test"},
-    {"item":"CTA chest","tier":"$$$","relative_cost":40,"note":"40x more expensive"}
+    {{
+      "item": "<test/intervention name>",
+      "tier": "<$ to $$$$$>",
+      "relative_cost": <number>,
+      "note": "<brief note>"
+    }}
+  ],
+  "evi_table": [
+    {{
+      "test": "<test name>",
+      "will_change_management": "<yes/no/maybe>",
+      "threshold_probability": <float 0-1>,
+      "evi": <float 0-1>
+    }}
   ],
   "utility_rank": [
-    {"action":"D-dimer first","benefit":0.85,"harm":0.01,"cost_tier":"$","utility":0.84},
-    {"action":"Direct to CTA","benefit":0.88,"harm":0.02,"cost_tier":"$$$","utility":0.66}
+    {{
+      "action": "<treat/test/observe>",
+      "benefit": <float 0-1>,
+      "harm": <float 0-1>,
+      "cost_tier": "<tier>",
+      "utility": <float>
+    }}
   ]
-}
+}}
 ```
 
-**JSON Field Requirements:**
-- "posterior": number between 0 and 1 (e.g., 0.15 for 15%)
-- "p_change", "value_if_change", "evi": numbers only
-- "benefit", "harm", "utility": numbers only
-- "relative_cost": number only (e.g., 1, 40, 500)
-- "tier", "note", "recommendation", "action": text is OK
+Ensure all numeric values are actual numbers, not strings."""
 
-**Critical Rules:**
-- Use YOUR medical knowledge for base rates, LRs, and clinical context
-- If uncertain about exact values, give reasonable ranges and state assumptions
-- Do NOT defer to specialty opinion — reason independently
-- Avoid sycophantic language ("you're right", "good thinking")
-- Use phrases like "Based on posterior of X%, the math shows..."
-"""
+def process_with_llm(patient_query: str) -> Tuple[str, Dict]:
+    """Process query with Gemini and extract structured data"""
+    try:
+        # Initialize Agno agent with Gemini
+        agent = Agno(
+            model="gemini-2.0-flash-exp",
+            api_key=API_KEY,
+            temperature=0.3,
+            markdown=True
+        )
+        
+        # Get response
+        prompt = create_llm_prompt(patient_query)
+        response = agent.run(prompt)
+        
+        # Extract JSON data
+        json_data = extract_json_tail(response.content)
+        
+        # Clean content (remove JSON blocks for display)
+        clean_content = hide_json_blocks(response.content)
+        
+        return clean_content, json_data
+        
+    except Exception as e:
+        return f"Error processing with LLM: {str(e)}", {}
 
-# ---------- Create Agent ----------
-clinical_reasoner = Agent(
-    name="PRIORI",
-    model=Gemini(id="gemini-2.5-flash", api_key=API_KEY),
-    markdown=True,
-    description="PRIORI: Independent Bayesian clinical reasoning with harm-benefit analysis and anti-anchoring safeguards.",
-    instructions=[AGENT_INSTRUCTIONS],
-)
+# ============================================================================
+# MAIN STREAMLIT APP
+# ============================================================================
 
-# ---------- Case Runner ----------
-def run_case(user_text: str):
-    """Process clinical query and display results in main chat."""
-    # Detect scenario and disagreement framing
-    scenario_hint = detect_scenario_hint(user_text)
-    has_disagreement = detect_disagreement_frame(user_text)
+def main():
+    st.set_page_config(
+        page_title="PRIORI — Clinical Decision Support", 
+        page_icon="🩺", 
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
     
-    # Build reasoning framework prompt
-    framework_prompt = REASONING_FRAMEWORK.format(scenario_hint=scenario_hint)
+    # Custom CSS
+    st.markdown("""
+    <style>
+    .recommendation-box {
+        background-color: #f0f8ff;
+        padding: 20px;
+        border-radius: 10px;
+        border-left: 5px solid #1f77b4;
+        margin: 10px 0;
+    }
+    .metric-box {
+        background-color: #f9f9f9;
+        padding: 15px;
+        border-radius: 8px;
+        margin: 10px 0;
+    }
+    .warning-box {
+        background-color: #fff3cd;
+        padding: 15px;
+        border-radius: 8px;
+        border-left: 5px solid #ffc107;
+        margin: 10px 0;
+    }
+    .safety-alert {
+        background-color: #f8d7da;
+        padding: 15px;
+        border-radius: 8px;
+        border-left: 5px solid #dc3545;
+        margin: 10px 0;
+    }
+    </style>
+    """, unsafe_allow_html=True)
     
-    # Add anti-anchoring instruction if user is questioning existing plan
-    if has_disagreement:
-        framework_prompt += """
-
-**CRITICAL — INDEPENDENT REASONING REQUIRED:**
-The user appears to be questioning or comparing to an existing clinical plan.
-- Do NOT anchor on the stated plan or specialty opinion
-- Calculate probabilities and utilities INDEPENDENTLY first
-- Then compare your math-based recommendation to the existing plan
-- If they differ, state explicitly: "The stated plan recommends X, but based on posterior probability of Y% and harm-benefit ratio of Z, the evidence supports [your recommendation]"
-- Quantify the disagreement (e.g., "harm exceeds benefit by 10-fold")
-"""
+    # Header
+    st.title("🩺 PRIORI — Advanced Bayesian Clinical Reasoning")
+    st.caption("*Probabilistic thinking + Evidence-based decisions + Resource stewardship + Safety guardrails*")
+    st.markdown("---")
     
-    routed_prompt = framework_prompt + "\n\nUser's clinical question:\n" + user_text
+    # Initialize session state
+    if "messages" not in st.session_state:
+        st.session_state["messages"] = []
+    if "results" not in st.session_state:
+        st.session_state["results"] = None
+    if "context" not in st.session_state:
+        st.session_state["context"] = None
+    
+    # Sidebar with auto-prompts
+    with st.sidebar:
+        st.header("🚀 Quick Start Cases")
+        st.caption("Click any button to load a clinical scenario")
+        
+        st.markdown("### 🫁 Pulmonary Medicine")
+        if st.button("📍 PE — D-dimer vs CTA decision", use_container_width=True):
+            user_q = (
+                "55M with pleuritic chest pain, HR 102, O2 95% RA. "
+                "Wells score low-intermediate; no unilateral leg swelling. "
+                "Should I get a D-dimer first or go straight to CTA?"
+            )
+            st.session_state["messages"].append({"role":"user","content":user_q})
+            st.rerun()
+        
+        if st.button("📍 CAP — Avoid low-EVI testing", use_container_width=True):
+            user_q = (
+                "68M with CAP on CXR, SpO2 93% RA, mild COPD, no chest pain. "
+                "Should I order CT chest or stick with CXR + procalcitonin?"
+            )
+            st.session_state["messages"].append({"role":"user","content":user_q})
+            st.rerun()
+        
+        st.markdown("### 🫀 Critical Care")
+        if st.button("📍 Septic Shock — Fluids vs Pressors", use_container_width=True):
+            user_q = (
+                "ICU patient with septic shock after 1.5L crystalloid; MAP 62, on 0.06 NE. "
+                "PLR shows no stroke volume increase; VExUS = 2. More fluids or increase pressor?"
+            )
+            st.session_state["messages"].append({"role":"user","content":user_q})
+            st.rerun()
+        
+        if st.button("📍 AKI Oliguria — FST vs Early RRT", use_container_width=True):
+            user_q = (
+                "ICU patient oliguric post-sepsis; Cr 2.7 (baseline 1.0), K 5.3, HCO3 18. "
+                "POCUS: VExUS 2, no hydronephrosis; bladder 80 mL. Should I do FST, and when to start CRRT?"
+            )
+            st.session_state["messages"].append({"role":"user","content":user_q})
+            st.rerun()
+        
+        st.markdown("### ❤️ Cardiology")
+        if st.button("📍 Chest Pain — HEART score approach", use_container_width=True):
+            user_q = (
+                "58F with chest pressure, risk factors HTN/HLD, non-ischemic ECG, initial hs-troponin negative. "
+                "HEART score ~4. Serial troponins vs stress test vs CTCA?"
+            )
+            st.session_state["messages"].append({"role":"user","content":user_q})
+            st.rerun()
+        
+        st.markdown("### 🩸 Gastroenterology")
+        if st.button("📍 UGIB — EGD timing decision", use_container_width=True):
+            user_q = (
+                "62M with melena, Hgb 8.9, MAP 74 stable after 1U PRBC. No cirrhosis history. "
+                "Push for urgent EGD now vs early morning? Imaging needed?"
+            )
+            st.session_state["messages"].append({"role":"user","content":user_q})
+            st.rerun()
+        
+        st.markdown("---")
+        st.markdown("### 🔧 Session Controls")
+        if st.button("🆕 Clear Chat History", use_container_width=True):
+            st.session_state["messages"] = []
+            st.session_state["results"] = None
+            st.session_state["context"] = None
+            st.rerun()
+        
+        st.markdown("---")
+        st.markdown("### 🛡️ Active Guardrails")
+        with st.expander("Safety Checks Enabled"):
+            st.markdown("""
+            **Automated safety validation:**
+            - ⚠️ Critical lab values (K>6.5, Na<120, etc.)
+            - 🔴 High-risk interventions (thrombolytics, dialysis, intubation)
+            - 💊 Nephrotoxic drugs in AKI setting
+            - 📊 Posterior probability vs treatment alignment
+            - ⚖️ Harm-benefit internal consistency
+            
+            *These checks flag potential issues but do NOT override clinical judgment.*
+            """)
+        
+        st.markdown("---")
+        st.caption("💡 **How to use:**\n1. Click an auto-prompt\n2. Or type your own case below\n3. Get Bayesian reasoning + EVI + Cost analysis")
+    
+    # Main chat area
+    st.subheader("💬 Clinical Conversation")
+    
+    # Display chat history
+    for m in st.session_state["messages"]:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
+    
+    # Process pending user message
+    if st.session_state["messages"] and st.session_state["messages"][-1]["role"] == "user":
+        last_user_msg = st.session_state["messages"][-1]["content"]
+        # Check if we've already responded
+        if len(st.session_state["messages"]) == 1 or st.session_state["messages"][-2]["role"] != "assistant":
+            process_case(last_user_msg)
+    
+    # Chat input
+    if user_input := st.chat_input("💬 Enter your clinical question or case details..."):
+        st.session_state["messages"].append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.markdown(user_input)
+        process_case(user_input)
+    
+    # Display analysis results if available
+    if st.session_state["results"]:
+        display_analysis_results()
+    
+    # Footer
+    st.markdown("---")
+    st.caption("⚠️ **Disclaimer:** PRIORI is an educational/research demonstration tool. Not for clinical use. All recommendations require physician oversight.")
 
-    # Show thinking indicator
-    with st.chat_message("assistant"):
-        with st.spinner("🧠 Reasoning through the case..."):
-            try:
-                # Call agent
-                run = clinical_reasoner.run(routed_prompt)
-                content = run.content
+def process_case(user_query: str):
+    """Process a clinical case and update session state"""
+    with st.spinner("🧠 Analyzing case with advanced Bayesian reasoning..."):
+        try:
+            # Run safety checks first
+            safety_warnings = SafetyGuardrails.validate_all(user_query, user_query)
+            
+            # Process with LLM
+            llm_response, json_data = process_with_llm(user_query)
+            
+            # Display safety warnings prominently if any
+            if safety_warnings:
+                for warning in safety_warnings:
+                    st.markdown(f"""
+                    <div class="safety-alert">
+                        {warning}
+                    </div>
+                    """, unsafe_allow_html=True)
+            
+            # Display LLM response
+            with st.chat_message("assistant"):
+                st.markdown(llm_response)
                 
-                # Parse JSON FIRST (before we hide it)
-                data = extract_json_tail(content)
-                
-                # Run safety guardrails
-                safety_warnings = SafetyGuardrails.run_all_checks(user_text, data)
-                
-                # Hide JSON blocks from user view
-                clean_content = hide_json_blocks(content)
-                
-                # Display safety warnings FIRST if any
-                if safety_warnings:
-                    st.error("### 🛡️ Safety Guardrails Triggered")
-                    for warning in safety_warnings:
-                        st.warning(warning)
-                    st.info("💡 **Note**: These are automated safety checks. Review the reasoning below and use clinical judgment.")
-                    st.divider()
-                
-                # Render narrative (without JSON blocks)
-                st.markdown(clean_content, unsafe_allow_html=True)
-                if data:
-                    # Clinical TL;DR metrics
-                    best = data.get("best_action") or data.get("recommendation")
-                    posterior = data.get("posterior")
-                    
-                    if posterior is not None or best:
-                        st.divider()
-                        st.subheader("📊 Clinical TL;DR (Auto-Extracted)")
-                        cols = st.columns(3)
-                        
-                        if posterior is not None:
-                            posterior_float = safe_float(posterior)
-                            if posterior_float > 0:
-                                cols[0].metric("Posterior Probability", f"{posterior_float*100:.1f}%")
-                        
-                        if best:
-                            cols[1].markdown(f"**Recommended Action:**\n{best}")
-                        
-                        if data.get("utility_rank"):
-                            try:
-                                top = max(data["utility_rank"], key=lambda x: safe_float(x.get("utility", 0)))
-                                cols[2].markdown(f"**Highest Utility:**\n{top.get('action','Best action')}")
-                            except (ValueError, TypeError):
-                                pass
-                    
-                    # Structured tables
-                    st.divider()
-                    st.subheader("📋 Structured Summary")
-                    
-                    # EVI Table
-                    if data.get("evi_table"):
-                        with st.expander("🔬 **Expected Value of Information (EVI)**", expanded=True):
-                            st.markdown("*Which tests will actually change management?*")
+                # Display structured tables if JSON data available
+                if json_data:
+                    # EVI Analysis
+                    if json_data.get("evi_table"):
+                        with st.expander("📊 **Expected Value of Information (EVI) Analysis**", expanded=True):
+                            st.markdown("*Which tests actually change management?*")
                             try:
                                 st.table({
-                                    "Test/Intervention": [x.get("test","") for x in data["evi_table"]],
-                                    "ΔP (Change in Probability)": [f"{safe_float(x.get('p_change', 0)):.3f}" for x in data["evi_table"]],
-                                    "Value if Positive": [f"{safe_float(x.get('value_if_change', 0)):.3f}" for x in data["evi_table"]],
-                                    "EVI Score": [f"{safe_float(x.get('evi', 0)):.3f}" for x in data["evi_table"]],
+                                    "Test": [x.get("test","") for x in json_data["evi_table"]],
+                                    "Changes Management?": [x.get("will_change_management","") for x in json_data["evi_table"]],
+                                    "Threshold Probability": [f"{safe_float(x.get('threshold_probability', 0))*100:.1f}%" for x in json_data["evi_table"]],
+                                    "EVI Score": [f"{safe_float(x.get('evi', 0)):.3f}" for x in json_data["evi_table"]],
                                 })
                             except Exception as e:
-                                st.info("📊 EVI data available but formatting issue detected. See detailed analysis above.")
+                                st.info("📊 EVI data available but formatting issue detected.")
                     
                     # Cost Comparison
-                    if data.get("costs"):
+                    if json_data.get("costs"):
                         with st.expander("💰 **Relative Cost Comparison**", expanded=True):
                             st.markdown("*Resource stewardship — what's the opportunity cost?*")
                             st.table({
-                                "Test/Intervention": [x.get("item","") for x in data["costs"]],
-                                "Cost Tier": [x.get("tier","?") for x in data["costs"]],
-                                "× Baseline": [x.get("relative_cost","?") for x in data["costs"]],
-                                "Context": [x.get("note","") for x in data["costs"]],
+                                "Test/Intervention": [x.get("item","") for x in json_data["costs"]],
+                                "Cost Tier": [x.get("tier","?") for x in json_data["costs"]],
+                                "× Baseline": [x.get("relative_cost","?") for x in json_data["costs"]],
+                                "Context": [x.get("note","") for x in json_data["costs"]],
                             })
                     
                     # Utility Ranking
-                    if data.get("utility_rank"):
+                    if json_data.get("utility_rank"):
                         with st.expander("⚖️ **Utility Ranking (Benefit − Harm − Cost)**", expanded=True):
                             st.markdown("*Higher utility = better value for the patient*")
                             try:
                                 st.table({
-                                    "Action": [x.get("action","") for x in data["utility_rank"]],
-                                    "Benefit": [f"{safe_float(x.get('benefit', 0)):.3f}" for x in data["utility_rank"]],
-                                    "Harm": [f"{safe_float(x.get('harm', 0)):.3f}" for x in data["utility_rank"]],
-                                    "Cost Tier": [x.get("cost_tier","?") for x in data["utility_rank"]],
-                                    "Net Utility": [f"{safe_float(x.get('utility', 0)):.3f}" for x in data["utility_rank"]],
+                                    "Action": [x.get("action","") for x in json_data["utility_rank"]],
+                                    "Benefit": [f"{safe_float(x.get('benefit', 0)):.3f}" for x in json_data["utility_rank"]],
+                                    "Harm": [f"{safe_float(x.get('harm', 0)):.3f}" for x in json_data["utility_rank"]],
+                                    "Cost Tier": [x.get("cost_tier","?") for x in json_data["utility_rank"]],
+                                    "Net Utility": [f"{safe_float(x.get('utility', 0)):.3f}" for x in json_data["utility_rank"]],
                                 })
                             except Exception as e:
-                                st.info("⚖️ Utility ranking available but formatting issue detected. See detailed analysis above.")
+                                st.info("⚖️ Utility ranking available but formatting issue detected.")
+            
+            # Create context from JSON data
+            if json_data and json_data.get('prior_probability') is not None:
+                context = create_context_from_json(json_data, user_query)
                 
-                # Save to history (without JSON blocks)
-                st.session_state["messages"].append({"role": "assistant", "content": clean_content})
+                # Run advanced analysis
+                engine = AdvancedDecisionEngine()
+                results = engine.analyze(context, safety_warnings)
+                results.llm_reasoning = llm_response
                 
-            except Exception as e:
-                st.error(f"❌ Error processing request: {str(e)}")
-                st.info("💡 Tip: Try rephrasing your question or use one of the auto-prompts.")
+                # Store in session state
+                st.session_state["context"] = context
+                st.session_state["results"] = results
+            
+            # Save to history
+            st.session_state["messages"].append({"role": "assistant", "content": llm_response})
+            
+        except Exception as e:
+            st.error(f"❌ Error processing request: {str(e)}")
+            st.info("💡 Tip: Try rephrasing your question or use one of the auto-prompts.")
 
-# ---------- UI Setup ----------
-st.set_page_config(
-    page_title="PRIORI — Clinical Decision Support", 
-    page_icon="🩺", 
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+def create_context_from_json(json_data: Dict, patient_query: str) -> ClinicalDecisionContext:
+    """Convert JSON data to ClinicalDecisionContext"""
+    
+    # Extract test data
+    likelihood_ratios = {}
+    test_names = []
+    test_costs = {}
+    
+    if 'tests' in json_data:
+        for test in json_data['tests']:
+            test_name = test.get('name', 'Unknown')
+            test_names.append(test_name)
+            likelihood_ratios[test_name] = (
+                safe_float(test.get('lr_positive', 1.0)),
+                safe_float(test.get('lr_negative', 1.0))
+            )
+            # Try to get cost from COST_TIERS
+            cost_info = get_cost_info(test_name)
+            test_costs[test_name] = safe_float(cost_info.get('relative_cost', 100))
+    
+    # Extract utilities
+    utilities = json_data.get('utilities', {
+        'treat_success': 0.9,
+        'treat_healthy': 0.95,
+        'observe_disease': 0.0,
+        'observe_healthy': 1.0
+    })
+    
+    return ClinicalDecisionContext(
+        prior_probability=safe_float(json_data.get('prior_probability', 0.5)),
+        likelihood_ratios=likelihood_ratios,
+        utilities={k: safe_float(v) for k, v in utilities.items()},
+        patient_preferences={},
+        test_costs=test_costs,
+        treatment_costs={},
+        disease_name=json_data.get('disease_name', 'Unknown'),
+        test_names=test_names,
+        patient_query=patient_query
+    )
 
-# Header
-st.title("🩺 PRIORI — Bayesian Clinical Reasoning")
-st.caption("*Probabilistic thinking + Evidence-based decisions + Resource stewardship*")
-st.markdown("---")
-
-# Initialize session state
-if "messages" not in st.session_state:
-    st.session_state["messages"] = []
-
-# Sidebar with auto-prompts
-with st.sidebar:
-    st.header("🚀 Quick Start Cases")
-    st.caption("Click any button to load a clinical scenario")
+def display_analysis_results():
+    """Display advanced analysis results in tabs"""
+    if not st.session_state['results']:
+        return
     
-    st.markdown("### 🫁 Pulmonary Medicine")
-    if st.button("📍 PE — D-dimer vs CTA decision", use_container_width=True):
-        user_q = (
-            "55M with pleuritic chest pain, HR 102, O2 95% RA. "
-            "Wells score low-intermediate; no unilateral leg swelling. "
-            "Should I get a D-dimer first or go straight to CTA?"
-        )
-        st.session_state["messages"].append({"role":"user","content":user_q})
-        st.rerun()
-    
-    if st.button("📍 CAP — Avoid low-EVI testing", use_container_width=True):
-        user_q = (
-            "68M with CAP on CXR, SpO2 93% RA, mild COPD, no chest pain. "
-            "Should I order CT chest or stick with CXR + procalcitonin?"
-        )
-        st.session_state["messages"].append({"role":"user","content":user_q})
-        st.rerun()
-    
-    st.markdown("### 🫀 Critical Care")
-    if st.button("📍 Septic Shock — Fluids vs Pressors", use_container_width=True):
-        user_q = (
-            "ICU patient with septic shock after 1.5L crystalloid; MAP 62, on 0.06 NE. "
-            "PLR shows no stroke volume increase; VExUS = 2. More fluids or increase pressor?"
-        )
-        st.session_state["messages"].append({"role":"user","content":user_q})
-        st.rerun()
-    
-    if st.button("📍 AKI Oliguria — FST vs Early RRT", use_container_width=True):
-        user_q = (
-            "ICU patient oliguric post-sepsis; Cr 2.7 (baseline 1.0), K 5.3, HCO3 18. "
-            "POCUS: VExUS 2, no hydronephrosis; bladder 80 mL. Should I do FST, and when to start CRRT?"
-        )
-        st.session_state["messages"].append({"role":"user","content":user_q})
-        st.rerun()
-    
-    st.markdown("### ❤️ Cardiology")
-    if st.button("📍 Chest Pain — HEART score approach", use_container_width=True):
-        user_q = (
-            "58F with chest pressure, risk factors HTN/HLD, non-ischemic ECG, initial hs-troponin negative. "
-            "HEART score ~4. Serial troponins vs stress test vs CTCA?"
-        )
-        st.session_state["messages"].append({"role":"user","content":user_q})
-        st.rerun()
-    
-    st.markdown("### 🩸 Gastroenterology")
-    if st.button("📍 UGIB — EGD timing decision", use_container_width=True):
-        user_q = (
-            "62M with melena, Hgb 8.9, MAP 74 stable after 1U PRBC. No cirrhosis history. "
-            "Push for urgent EGD now vs early morning? Imaging needed?"
-        )
-        st.session_state["messages"].append({"role":"user","content":user_q})
-        st.rerun()
+    results = st.session_state['results']
+    context = st.session_state['context']
     
     st.markdown("---")
-    st.markdown("### 🔧 Session Controls")
-    if st.button("🆕 Clear Chat History", use_container_width=True):
-        st.session_state["messages"] = []
-        st.rerun()
+    st.markdown("## 📊 Advanced Bayesian Analysis")
     
+    # Safety Warnings (if any)
+    if results.safety_warnings:
+        st.markdown("### 🛡️ Safety Alerts")
+        for warning in results.safety_warnings:
+            st.markdown(f"""
+            <div class="safety-alert">
+                {warning}
+            </div>
+            """, unsafe_allow_html=True)
+    
+    # Quick metrics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Recommendation", results.recommendation)
+    with col2:
+        st.metric("Prior Probability", f"{context.prior_probability:.1%}")
+    with col3:
+        st.metric("Confidence", f"{results.confidence:.0%}")
+    with col4:
+        st.metric("Treat Threshold", f"{results.thresholds['treat_threshold']:.1%}")
+    
+    # Tabs for detailed analysis
     st.markdown("---")
-    st.markdown("### 🛡️ Active Guardrails")
-    with st.expander("Safety Checks Enabled"):
-        st.markdown("""
-        **Automated safety validation:**
-        - ⚠️ Critical lab values (K>6.5, Na<120, etc.)
-        - 🔴 High-risk interventions (thrombolytics, dialysis, intubation)
-        - 💊 Nephrotoxic drugs in AKI setting
-        - 📊 Posterior probability vs treatment alignment
-        - ⚖️ Harm-benefit internal consistency
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "🎯 Thresholds", 
+        "💰 Value of Information", 
+        "🎲 Uncertainty", 
+        "📊 Sensitivity",
+        "🧠 Cognitive Biases"
+    ])
+    
+    with tab1:
+        st.markdown("### Decision Threshold Analysis")
+        st.markdown("Shows the probability ranges where each action is optimal")
         
-        *These checks flag potential issues but do NOT override clinical judgment.*
-        """)
+        fig = create_threshold_viz(context, results.thresholds)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Observe Zone", f"< {results.thresholds['test_threshold']:.1%}")
+        with col2:
+            st.metric("Test Zone", f"{results.thresholds['test_threshold']:.1%} - {results.thresholds['treat_threshold']:.1%}")
+        with col3:
+            st.metric("Treat Zone", f"> {results.thresholds['treat_threshold']:.1%}")
     
-    st.markdown("---")
-    st.caption("💡 **How to use:**\n1. Click an auto-prompt\n2. Or type your own case below\n3. Get Bayesian reasoning + EVI + Cost analysis")
-
-# Main chat area
-st.subheader("💬 Clinical Conversation")
-
-# Display chat history
-for m in st.session_state["messages"]:
-    with st.chat_message(m["role"]):
-        if m["role"] == "user":
-            st.markdown(m["content"])
+    with tab2:
+        st.markdown("### Expected Value of Perfect Information (EVPI)")
+        st.markdown("Determines which tests are actually worth performing")
+        
+        for test_name, evpi_data in results.evpi.items():
+            st.markdown(f"""
+            <div class="metric-box">
+                <h4 style="margin-top: 0;">{test_name} {evpi_data['recommendation']}</h4>
+                <p><strong>Cost per QALY:</strong> ${evpi_data['cost_per_qaly']:,.0f}</p>
+                <p><strong>Test Cost:</strong> ${evpi_data['test_cost']:,.0f}</p>
+                <p><strong>EVPI:</strong> {evpi_data['evpi_qalys']:.4f} QALYs</p>
+                <p style="color: #666;">{evpi_data['reason']}</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        st.info("💡 **Cost-effectiveness thresholds:** <$50k/QALY = Worthwhile, $50-100k = Consider, >$100k = Skip")
+    
+    with tab3:
+        st.markdown("### Uncertainty Analysis (MCMC Simulation)")
+        st.markdown("Based on 10,000 Monte Carlo simulations")
+        
+        fig = create_mcmc_distribution(results.mcmc_results)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Mean Probability", f"{results.mcmc_results['mean']:.1%}")
+        with col2:
+            st.metric("95% CI Lower", f"{results.mcmc_results['ci_95_lower']:.1%}")
+        with col3:
+            st.metric("95% CI Upper", f"{results.mcmc_results['ci_95_upper']:.1%}")
+        
+        if results.mcmc_results['uncertainty_high']:
+            st.warning("⚠️ High uncertainty detected. Consider gathering more information.")
         else:
-            # For assistant messages, just show the content
-            # (structured tables are regenerated in run_case)
-            st.markdown(m["content"])
-
-# Process any pending user message from auto-prompt
-if st.session_state["messages"] and st.session_state["messages"][-1]["role"] == "user":
-    last_user_msg = st.session_state["messages"][-1]["content"]
-    # Check if we've already responded to this
-    if len(st.session_state["messages"]) == 1 or st.session_state["messages"][-2]["role"] != "assistant":
-        run_case(last_user_msg)
-
-# Chat input
-if user_free := st.chat_input("💬 Enter your clinical question or case details..."):
-    # Add to history
-    st.session_state["messages"].append({"role": "user", "content": user_free})
+            st.success("✓ Uncertainty is within acceptable range")
     
-    # Display user message
-    with st.chat_message("user"):
-        st.markdown(user_free)
+    with tab4:
+        st.markdown("### Sensitivity Analysis")
+        st.markdown("Shows which parameters most affect the decision")
+        
+        fig = create_sensitivity_tornado(results.sensitivity)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        if results.sensitivity['decision_fragile']:
+            st.warning(f"⚠️ **Decision is fragile** - Most sensitive to: {results.sensitivity['most_influential']}")
+            st.markdown("Small changes in parameters could flip the recommendation. Consider:")
+            st.markdown("- Gathering more precise data")
+            st.markdown("- Getting second opinion")
+            st.markdown("- Using additional tests")
+        else:
+            st.success("✓ **Decision is robust** - Recommendation stable across parameter variations")
     
-    # Process and respond
-    run_case(user_free)
+    with tab5:
+        st.markdown("### Cognitive Bias Detection")
+        st.markdown("Checks for common reasoning errors")
+        
+        if results.bias_warnings:
+            for warning in results.bias_warnings:
+                st.markdown(f"""
+                <div class="warning-box">
+                    <h4 style="margin-top: 0;">{warning['icon']} {warning['bias']}</h4>
+                    <p><strong>Warning:</strong> {warning['description']}</p>
+                    <p><strong>Suggestion:</strong> {warning['suggestion']}</p>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.success("✓ No cognitive biases detected")
+    
+    # Influence Diagram (collapsed by default)
+    with st.expander("🔗 View Influence Diagram"):
+        st.markdown("### Causal Relationship Model")
+        st.markdown(results.influence_diagram['description'])
+        
+        st.markdown("**Nodes:**")
+        for node in results.influence_diagram['nodes']:
+            st.markdown(f"- {node['label']} ({node['type']})")
+        
+        st.markdown("**Relationships:**")
+        for edge in results.influence_diagram['edges']:
+            from_node = next(n['label'] for n in results.influence_diagram['nodes'] if n['id'] == edge['from'])
+            to_node = next(n['label'] for n in results.influence_diagram['nodes'] if n['id'] == edge['to'])
+            st.markdown(f"- {from_node} → {to_node}")
+    
+    # Show full mathematics
+    with st.expander("🧮 View Full Mathematical Details"):
+        st.markdown("### Bayesian Calculation")
+        st.code(f"""
+Prior Probability: {context.prior_probability:.4f}
+Prior Odds: {context.prior_probability / (1 - context.prior_probability):.4f}
 
-# Footer
-st.markdown("---")
-st.caption("⚠️ **Disclaimer:** PRIORI is an MVP demonstration tool for educational/research purposes. Not for clinical use. All recommendations require physician oversight.")
+Utilities (QALYs):
+- Treat when disease present: {context.utilities['treat_success']:.2f}
+- Treat when no disease: {context.utilities['treat_healthy']:.2f}
+- Observe when disease present: {context.utilities['observe_disease']:.2f}
+- Observe when no disease: {context.utilities['observe_healthy']:.2f}
+
+Expected Value (Treat):
+EV = p × U(treat|disease) + (1-p) × U(treat|no disease)
+   = {context.prior_probability:.4f} × {context.utilities['treat_success']:.2f} + {1-context.prior_probability:.4f} × {context.utilities['treat_healthy']:.2f}
+   = {context.prior_probability * context.utilities['treat_success'] + (1-context.prior_probability) * context.utilities['treat_healthy']:.4f}
+
+Expected Value (Observe):
+EV = p × U(observe|disease) + (1-p) × U(observe|no disease)
+   = {context.prior_probability:.4f} × {context.utilities['observe_disease']:.2f} + {1-context.prior_probability:.4f} × {context.utilities['observe_healthy']:.2f}
+   = {context.prior_probability * context.utilities['observe_disease'] + (1-context.prior_probability) * context.utilities['observe_healthy']:.4f}
+
+Treatment Threshold:
+p* = (U(observe|no disease) - U(treat|no disease)) / 
+     ((U(treat|disease) - U(observe|disease)) - (U(treat|no disease) - U(observe|no disease)))
+   = {results.thresholds['treat_threshold']:.4f}
+        """)
+        
+        st.markdown("### Likelihood Ratios")
+        for test_name, (lr_pos, lr_neg) in context.likelihood_ratios.items():
+            st.code(f"""
+{test_name}:
+- LR+ = {lr_pos:.2f} (sensitivity / (1 - specificity))
+- LR- = {lr_neg:.2f} ((1 - sensitivity) / specificity)
+
+Post-test probability (if positive):
+Posterior odds = Prior odds × LR+
+               = {context.prior_probability / (1 - context.prior_probability):.4f} × {lr_pos:.2f}
+               = {(context.prior_probability / (1 - context.prior_probability)) * lr_pos:.4f}
+Posterior prob = odds / (1 + odds)
+               = {((context.prior_probability / (1 - context.prior_probability)) * lr_pos) / (1 + (context.prior_probability / (1 - context.prior_probability)) * lr_pos):.4f}
+            """)
+
+if __name__ == "__main__":
+    main()

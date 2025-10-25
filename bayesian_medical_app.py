@@ -1,5 +1,5 @@
-# app_priori_auto_router.py
-# PRIORI — Auto-parameters + Auto-Policy Routing + Digestible Output + Auto Prompts
+# app_priori_improved.py
+# PRIORI — Bayesian + EVI + Utility with Relative Cost Tiers & Improved UX
 
 import re
 import json
@@ -9,17 +9,63 @@ import streamlit as st
 from agno.agent import Agent
 from agno.models.google import Gemini
 
-# --- Configuration & Setup (unchanged for your testing) ---
-try:
-    API_KEY = 'AIzaSyDmcPbEDAEojTomYs7vLKu107fOa7c6500'
-except (FileNotFoundError, KeyError):
-    st.error("API Key not found. Please create a .streamlit/secrets.toml file with your API_KEY.")
-    st.stop()
+# --- Configuration ---
+API_KEY = 'AIzaSyDmcPbEDAEojTomYs7vLKu107fOa7c6500'
+
+# ---------- Cost Tiers (Simplified for MVP) ----------
+COST_TIERS = {
+    # PE workup
+    "D-dimer": {"tier": "$", "relative_cost": 1, "note": "Low-cost screening"},
+    "CTA chest": {"tier": "$$$", "relative_cost": 40, "note": "40× more than D-dimer"},
+    "VQ scan": {"tier": "$$", "relative_cost": 20, "note": "Mid-cost alternative"},
+    
+    # Chest pain workup
+    "hs-troponin (single)": {"tier": "$", "relative_cost": 1, "note": "Low-cost biomarker"},
+    "Serial troponins": {"tier": "$", "relative_cost": 2, "note": "2 draws + monitoring"},
+    "CTCA": {"tier": "$$$", "relative_cost": 30, "note": "30× more than troponin"},
+    "Stress echo": {"tier": "$$$", "relative_cost": 35, "note": "High-cost functional test"},
+    "Observation stay": {"tier": "$$", "relative_cost": 15, "note": "Mid-cost disposition"},
+    
+    # Sepsis management
+    "500mL crystalloid": {"tier": "$", "relative_cost": 0.5, "note": "Minimal cost"},
+    "Norepinephrine (day 1)": {"tier": "$", "relative_cost": 1.5, "note": "Low-cost pressor"},
+    "Vasopressin (day 1)": {"tier": "$", "relative_cost": 2, "note": "Low-cost add-on"},
+    "CT chest/abdomen": {"tier": "$$$", "relative_cost": 35, "note": "High-cost imaging"},
+    "Procalcitonin": {"tier": "$", "relative_cost": 2, "note": "Stewardship biomarker"},
+    
+    # AKI workup
+    "Renal ultrasound (bedside)": {"tier": "$", "relative_cost": 2, "note": "POCUS, low-cost"},
+    "Furosemide stress test": {"tier": "$", "relative_cost": 0.2, "note": "Drug + monitoring"},
+    "CRRT (per day)": {"tier": "$$$$$", "relative_cost": 100, "note": "Very high ongoing cost"},
+    "Daily CMP": {"tier": "$", "relative_cost": 1, "note": "Standard monitoring"},
+    
+    # UGIB management
+    "PPI infusion (day)": {"tier": "$", "relative_cost": 2, "note": "Standard therapy"},
+    "Octreotide (day)": {"tier": "$$", "relative_cost": 5, "note": "Variceal-specific"},
+    "Urgent EGD": {"tier": "$$$", "relative_cost": 70, "note": "Procedure + anesthesia"},
+    "CT abdomen": {"tier": "$$$", "relative_cost": 35, "note": "High-cost imaging"},
+    "PRBC (1 unit)": {"tier": "$$", "relative_cost": 10, "note": "Blood product"},
+    
+    # CAP management
+    "Chest X-ray": {"tier": "$", "relative_cost": 1, "note": "Standard screening"},
+    "CT chest": {"tier": "$$$", "relative_cost": 35, "note": "35× more than CXR"},
+    "Broad-spectrum antibiotics (day)": {"tier": "$$", "relative_cost": 8, "note": "Piperacillin-tazobactam"},
+    "Narrow-spectrum antibiotics (day)": {"tier": "$", "relative_cost": 2, "note": "Ceftriaxone, azithro"},
+}
+
+def get_cost_info(item_name: str) -> dict:
+    """Return cost tier info for display."""
+    return COST_TIERS.get(item_name, {
+        "tier": "?",
+        "relative_cost": "unknown",
+        "note": "Not in reference"
+    })
 
 # ---------- JSON tail extractor ----------
 JSON_BLOCK_PATTERN = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
 
 def extract_json_tail(text: str) -> Dict:
+    """Extract last valid JSON block from markdown response."""
     matches = JSON_BLOCK_PATTERN.findall(text or "")
     for raw in reversed(matches):
         try:
@@ -28,8 +74,9 @@ def extract_json_tail(text: str) -> Dict:
             continue
     return {}
 
-# ---------- Lightweight policy router ----------
+# ---------- Policy router ----------
 def detect_policy(user_text: str) -> str:
+    """Route query to appropriate clinical scenario context."""
     t = (user_text or "").lower()
     if any(k in t for k in ["pulmonary embol", " pe ", " pe.", "wells", "perc", "d-dimer", "d dimer"]):
         return "PE"
@@ -45,42 +92,49 @@ def detect_policy(user_text: str) -> str:
         return "CHESTPAIN"
     return "GEN"
 
-# Scenario-specific priors/thresholds cue (concise, for the LLM to reason with)
+# ---------- Policy context (updated with relative costs) ----------
 POLICY_CONTEXT = {
     "PE": """Scenario: Pulmonary Embolism rule-in/out.
-- Use Wells/PERC intuition; D-dimer useful in low/mod risk; CTA only when posterior remains above threshold.
-- Prefer avoiding CTA if EVI low. Costs (US approx): CTA $500–$800; D-dimer $15–$40.
-- Safety: anticoagulate only if posterior high / imaging positive or high clinical suspicion with instability.""",
-    "CAP": """Scenario: Community-acquired pneumonia (floor).
-- Favor CXR + procalcitonin, avoid CT unless atypical course.
-- Narrow/shorten antibiotics at 48–72h if improving (5 days typical).
-- Costs (US approx): CT chest $500–$700; daily broad labs $150–$300; broad abx/day $70–$150; narrow/day ~$20–$40.""",
+- Use Wells/PERC; D-dimer ($) first if low/moderate risk; CTA ($$$) only when posterior remains high.
+- Cost context: D-dimer is baseline cost; CTA is 40× more expensive. Avoid CTA if EVI is low.
+- Safety: anticoagulate only if posterior high / imaging positive or clinical instability.""",
+    
+    "CAP": """Scenario: Community-acquired pneumonia.
+- Favor CXR ($) + procalcitonin ($); avoid CT chest ($$$, 35× more) unless atypical course.
+- Narrow antibiotics ($$) preferred over broad ($$$) when appropriate; aim for 5-day course.
+- Cost context: CT adds minimal EVI in uncomplicated CAP.""",
+    
     "SEPSIS": """Scenario: Septic shock (ICU).
-- Early norepinephrine if MAP<65 after ≤1–2L; PLR/VExUS to guide fluids.
-- Balanced crystalloids preferred; add vasopressin when NE ~0.25–0.5 µg/kg/min; steroids if pressor-dependent.
-- Costs approx: 500 mL crystalloids ~$8; day-1 NE ~$25; CT chest/abd ~$500–$700. Avoid low-EVI imaging early.""",
-    "AKI": """Scenario: Oliguric AKI after sepsis.
-- Rule out obstruction (renal/bladder US). If VExUS≥2, avoid fluids; FST (1–1.5 mg/kg) stratifies RRT risk.
-- Start CRRT only for AEIOU or progression.
-- Costs approx: FST ~$2; US bedside ~$35; CRRT/day ~$1600; daily labs ~$150–$300.""",
-    "UGIB": """Scenario: Upper GI bleed (ICU).
-- PPI + resuscitation first. Add octreotide + ceftriaxone only if variceal probability high.
-- Urgent EGD ≤12h once stable; avoid CT unless perforation/unclear source post-EGD.
-- Costs approx: PPI infusion ~$35; octreotide day ~$85; urgent EGD ~$1100; CT abd ~$500–$700.""",
-    "CHESTPAIN": """Scenario: Chest pain (ED/inpatient ACS evaluation).
-- Use HEART or similar risk. If low risk and ECG/troponins negative (serial), discharge with follow-up.
-- Intermediate risk → serial hs-troponins, observation; avoid stress/CTCA if EVI low.
-- Costs (US approx): single hs-trop $20–$40; CTCA $400–$900; stress imaging $600–$1200.""",
+- Early norepinephrine ($) if MAP<65 after ≤1–2L crystalloids ($); use PLR/VExUS to guide fluids.
+- Add vasopressin ($) when NE ~0.25–0.5 µg/kg/min; steroids if pressor-dependent.
+- Cost context: Avoid low-EVI imaging ($$$) early; procalcitonin ($) helps stewardship.""",
+    
+    "AKI": """Scenario: Oliguric AKI post-sepsis.
+- Rule out obstruction with bedside ultrasound ($). If VExUS≥2, avoid fluids.
+- FST ($) stratifies RRT risk. Start CRRT ($$$$$, 500× more expensive) only for AEIOU or progression.
+- Cost context: FST is 500× cheaper than a day of CRRT.""",
+    
+    "UGIB": """Scenario: Upper GI bleed.
+- PPI ($) + resuscitation first. Octreotide ($$) + ceftriaxone only if variceal probability high.
+- Urgent EGD ($$$) ≤12h once stable. Avoid CT ($$$) unless perforation suspected.
+- Cost context: EGD is therapeutic; CT adds little EVI in typical UGIB.""",
+    
+    "CHESTPAIN": """Scenario: Chest pain ACS evaluation.
+- Use HEART score. Serial hs-troponins ($) + observation ($$) for low-intermediate risk.
+- Avoid stress imaging ($$$, 35× more) or CTCA ($$$, 30× more) if EVI low.
+- Cost context: Serial troponins have excellent NPV at 2× baseline cost.""",
+    
     "GEN": """Scenario: General inpatient reasoning.
-- Reduce uncertainty (Bayes), avoid low-value tests (EVI), choose highest-utility action (Benefit−Harm−Cost).
-- Use reasonable US costs and mark approximations; keep one clear recommendation."""
+- Apply Bayes (reduce uncertainty), EVI (avoid low-value tests), Utility (benefit−harm−cost).
+- Use relative cost tiers: $ = baseline, $$ = 5–15×, $$$ = 30–70×, $$$$$ = 100+×.
+- Keep one clear recommendation."""
 }
 
-# ---------- Agent Instructions (digestible output, math hidden) ----------
+# ---------- Agent Instructions (updated for relative costs) ----------
 HYBRID_INSTRUCTIONS = """
 You are PRIORI — a Bayesian clinical rounding assistant for inpatient/ICU care.
-Tone: professional, collegial, concise. Use internal medical knowledge to supply LRs and US cost ranges; mark approximations.
-Do all math silently; present an easy-to-digest summary. Keep one clear recommendation.
+Tone: professional, collegial, concise. Use internal medical knowledge for LRs and reasoning.
+Do all math silently; present an easy-to-digest summary with ONE clear recommendation.
 
 Required sections (Markdown, concise):
 
@@ -89,7 +143,7 @@ Required sections (Markdown, concise):
 ### Clinical TL;DR (for bedside)
 - Posterior: X%
 - Do now: single best next step (plain language)
-- Why: 2–3 bullets (Bayes → EVI → Utility)
+- Why: 2–3 bullets linking Bayes → EVI → Utility
 
 *(Math below is optional for readers)*
 
@@ -97,22 +151,22 @@ Required sections (Markdown, concise):
 <summary>Details (math & rationale)</summary>
 
 ### 1) Pre-Test Probability
-- Initial estimate (%), with brief rationale (rule or gestalt). Assumptions (one line).
+- Initial estimate (%), with brief rationale (rule or gestalt).
 
 ### 2) Evidence Update (LR Table)
-| Finding/Test | Result | LR (or LR+/LR−) | Source/Note |
+| Finding/Test | Result | LR | Source/Note |
 |---|---:|---:|---|
 | ... | ... | ... | ... |
 
-### 3) Post-Test Probability (quiet math)
+### 3) Post-Test Probability
 - Pre-odds × LR product → Post-odds → Posterior (%).
 
-### 4) Decision & Rationale (Bayes → EVI → Utility)
+### 4) Decision & Rationale
 - **Recommendation:** single best action.
-- Why now: link Bayes (posterior) → EVI (will testing change management?) → Utility (benefit−harm−cost).
-- Include simple US cost estimates (mean $ and uncertainty) for key actions.
+- Why: Link Bayes (posterior) → EVI (will testing change management?) → Utility (benefit−harm−cost).
+- Use RELATIVE cost tiers: $ (baseline), $$ (5–15× baseline), $$$ (30–70×), $$$$$ (100+×).
 - Safety overrides (if any).
-- Devil’s advocate (one-line alternative).
+- Devil's advocate (one-line alternative).
 
 </details>
 
@@ -124,158 +178,227 @@ Return a fenced JSON block with:
     {"test":"...","p_change":0.xx,"value_if_change":0.XX,"evi":0.xx}
   ],
   "costs": [
-    {"item":"...","mean_usd":123,"note":"approx US"}
+    {"item":"...","tier":"$","relative_cost":1,"note":"vs comparison"}
   ],
   "utility_rank": [
-    {"action":"...","benefit":0.xx,"harm":0.xx,"cost_usd":123,"utility":0.xx}
+    {"action":"...","benefit":0.xx,"harm":0.xx,"cost_tier":"$","utility":0.xx}
   ],
   "best_action": "plain-language single action"
 }
-Ensure valid JSON (no comments) in the final fenced block.
+Ensure valid JSON (no comments).
 """
 
+# ---------- Create Agent ----------
 clinical_reasoner = Agent(
     name="PRIORI",
-    model=Gemini(id="gemini-2.5-flash", api_key=API_KEY),  # <-- unchanged
+    model=Gemini(id="gemini-2.5-flash", api_key=API_KEY),
     markdown=True,
-    description="PRIORI: Bayesian + EVI + Utility bedside reasoning partner (auto-parameters, policy-routed).",
+    description="PRIORI: Bayesian + EVI + Utility clinical reasoning assistant with relative cost awareness.",
     instructions=[HYBRID_INSTRUCTIONS],
 )
 
-# ---------- Prompt runner (shared by chat input and auto buttons) ----------
+# ---------- Case Runner ----------
 def run_case(user_text: str):
-    # Route + preface
+    """Process clinical query and display results in main chat."""
+    # Route to appropriate policy
     policy = detect_policy(user_text)
     preface = f"Policy: {policy}\n\n{POLICY_CONTEXT.get(policy,'')}\n\nUser question:\n"
     routed_prompt = preface + user_text
 
-    # Call agent
-    run = clinical_reasoner.run(routed_prompt)
-    content = run.content
+    # Show thinking indicator
+    with st.chat_message("assistant"):
+        with st.spinner("🧠 Reasoning through the case..."):
+            try:
+                # Call agent
+                run = clinical_reasoner.run(routed_prompt)
+                content = run.content
+                
+                # Render narrative
+                st.markdown(content, unsafe_allow_html=True)
+                
+                # Parse JSON for structured summary
+                data = extract_json_tail(content)
+                if data:
+                    # Clinical TL;DR metrics
+                    best = data.get("best_action")
+                    posterior = data.get("posterior")
+                    
+                    if posterior is not None or best:
+                        st.divider()
+                        st.subheader("📊 Clinical TL;DR (Auto-Extracted)")
+                        cols = st.columns(3)
+                        
+                        if posterior is not None:
+                            cols[0].metric("Posterior Probability", f"{float(posterior)*100:.1f}%")
+                        
+                        if best:
+                            cols[1].markdown(f"**Recommended Action:**\n{best}")
+                        
+                        if data.get("utility_rank"):
+                            top = sorted(data["utility_rank"], key=lambda x: x.get("utility", 0.0), reverse=True)[0]
+                            cols[2].markdown(f"**Highest Utility:**\n{top.get('action','Best action')}")
+                    
+                    # Structured tables
+                    st.divider()
+                    st.subheader("📋 Structured Summary")
+                    
+                    # EVI Table
+                    if data.get("evi_table"):
+                        with st.expander("🔬 **Expected Value of Information (EVI)**", expanded=True):
+                            st.markdown("*Which tests will actually change management?*")
+                            st.table({
+                                "Test/Intervention": [x.get("test","") for x in data["evi_table"]],
+                                "ΔP (Change in Probability)": [f"{float(x.get('p_change',0.0)):.3f}" for x in data["evi_table"]],
+                                "Value if Positive": [f"{float(x.get('value_if_change',0.0)):.3f}" for x in data["evi_table"]],
+                                "EVI Score": [f"{float(x.get('evi',0.0)):.3f}" for x in data["evi_table"]],
+                            })
+                    
+                    # Cost Comparison
+                    if data.get("costs"):
+                        with st.expander("💰 **Relative Cost Comparison**", expanded=True):
+                            st.markdown("*Resource stewardship — what's the opportunity cost?*")
+                            st.table({
+                                "Test/Intervention": [x.get("item","") for x in data["costs"]],
+                                "Cost Tier": [x.get("tier","?") for x in data["costs"]],
+                                "× Baseline": [x.get("relative_cost","?") for x in data["costs"]],
+                                "Context": [x.get("note","") for x in data["costs"]],
+                            })
+                    
+                    # Utility Ranking
+                    if data.get("utility_rank"):
+                        with st.expander("⚖️ **Utility Ranking (Benefit − Harm − Cost)**", expanded=True):
+                            st.markdown("*Higher utility = better value for the patient*")
+                            st.table({
+                                "Action": [x.get("action","") for x in data["utility_rank"]],
+                                "Benefit": [f"{float(x.get('benefit',0.0)):.3f}" for x in data["utility_rank"]],
+                                "Harm": [f"{float(x.get('harm',0.0)):.3f}" for x in data["utility_rank"]],
+                                "Cost Tier": [x.get("cost_tier","?") for x in data["utility_rank"]],
+                                "Net Utility": [f"{float(x.get('utility',0.0)):.3f}" for x in data["utility_rank"]],
+                            })
+                
+                # Save to history
+                st.session_state["messages"].append({"role": "assistant", "content": content})
+                
+            except Exception as e:
+                st.error(f"❌ Error processing request: {str(e)}")
+                st.info("💡 Tip: Try rephrasing your question or use one of the auto-prompts.")
 
-    # Render narrative (digestible; details hidden)
-    st.markdown(content, unsafe_allow_html=True)
+# ---------- UI Setup ----------
+st.set_page_config(
+    page_title="PRIORI — Clinical Decision Support", 
+    page_icon="🩺", 
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-    # Parse JSON tail → TL;DR + Tables
-    data = extract_json_tail(content)
-    if data:
-        best = data.get("best_action")
-        posterior = data.get("posterior")
-        if posterior is not None or best:
-            st.divider()
-            st.subheader("Clinical TL;DR (auto)")
-            cols = st.columns(3)
-            if posterior is not None:
-                cols[0].metric("Posterior", f"{float(posterior)*100:.1f}%")
-            if best:
-                cols[1].markdown(f"**Do now:** {best}")
-            if data.get("utility_rank"):
-                top = sorted(data["utility_rank"], key=lambda x: x.get("utility", 0.0), reverse=True)[0]
-                cols[2].markdown(f"**Why:** {top.get('action','Best action')} has the highest utility.")
+# Header
+st.title("🩺 PRIORI — Bayesian Clinical Reasoning")
+st.caption("*Probabilistic thinking + Evidence-based decisions + Resource stewardship*")
+st.markdown("---")
 
-        st.divider()
-        st.subheader("Structured Summary")
-        if data.get("evi_table"):
-            st.markdown("**EVI (Expected Value of Information)**")
-            st.table({
-                "Test": [x.get("test","") for x in data["evi_table"]],
-                "ΔP": [round(float(x.get("p_change",0.0)), 3) for x in data["evi_table"]],
-                "Value(if change)": [round(float(x.get("value_if_change",0.0)), 3) for x in data["evi_table"]],
-                "EVI": [round(float(x.get("evi",0.0)), 3) for x in data["evi_table"]],
-            })
-        if data.get("costs"):
-            st.markdown("**Cost Snapshot (US, approx)**")
-            st.table({
-                "Item": [x.get("item","") for x in data["costs"]],
-                "Mean $": [x.get("mean_usd","") for x in data["costs"]],
-                "Note": [x.get("note","") for x in data["costs"]],
-            })
-        if data.get("utility_rank"):
-            st.markdown("**Utility Ranking (Higher = better value)**")
-            st.table({
-                "Action": [x.get("action","") for x in data["utility_rank"]],
-                "Benefit": [round(float(x.get("benefit",0.0)),3) for x in data["utility_rank"]],
-                "Harm": [round(float(x.get("harm",0.0)),3) for x in data["utility_rank"]],
-                "Cost ($)": [x.get("cost_usd","") for x in data["utility_rank"]],
-                "Utility": [round(float(x.get("utility",0.0)),3) for x in data["utility_rank"]],
-            })
-
-    # Save to history
-    st.session_state["messages"].append({"role": "assistant", "content": content})
-
-# ---------- UI ----------
-st.set_page_config(page_title="PRIORI — Bayesian/EVI/Utility (Auto + Routed)", page_icon="🩺", layout="wide")
-st.title("🩺 PRIORI — Bayesian • EVI • Utility")
-st.caption("Math in the background. Clinician-ready output up front.")
-
+# Initialize session state
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
 
-# Left: chat history
-for m in st.session_state["messages"]:
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
-
-# Sidebar: Auto Prompts (one-click)
+# Sidebar with auto-prompts
 with st.sidebar:
-    st.header("Auto Prompts (One-click cases)")
-    if st.button("PE — Low/Intermediate Risk (D-dimer vs CTA)"):
+    st.header("🚀 Quick Start Cases")
+    st.caption("Click any button to load a clinical scenario")
+    
+    st.markdown("### 🫁 Pulmonary Medicine")
+    if st.button("📍 PE — D-dimer vs CTA decision", use_container_width=True):
         user_q = (
             "55M with pleuritic chest pain, HR 102, O2 95% RA. "
-            "Wells low-intermediate; no unilateral leg swelling. Should I get a D-dimer first or go straight to CTA?"
+            "Wells score low-intermediate; no unilateral leg swelling. "
+            "Should I get a D-dimer first or go straight to CTA?"
         )
         st.session_state["messages"].append({"role":"user","content":user_q})
-        with st.chat_message("user"): st.markdown(user_q)
-        run_case(user_q)
-
-    if st.button("Septic Shock — Fluids vs Pressors (PLR/VExUS)"):
+        st.rerun()
+    
+    if st.button("📍 CAP — Avoid low-EVI testing", use_container_width=True):
+        user_q = (
+            "68M with CAP on CXR, SpO2 93% RA, mild COPD, no chest pain. "
+            "Should I order CT chest or stick with CXR + procalcitonin?"
+        )
+        st.session_state["messages"].append({"role":"user","content":user_q})
+        st.rerun()
+    
+    st.markdown("### 🫀 Critical Care")
+    if st.button("📍 Septic Shock — Fluids vs Pressors", use_container_width=True):
         user_q = (
             "ICU patient with septic shock after 1.5L crystalloid; MAP 62, on 0.06 NE. "
-            "PLR shows no stroke volume increase; VExUS = 2. Fluids or pressor now?"
+            "PLR shows no stroke volume increase; VExUS = 2. More fluids or increase pressor?"
         )
         st.session_state["messages"].append({"role":"user","content":user_q})
-        with st.chat_message("user"): st.markdown(user_q)
-        run_case(user_q)
-
-    if st.button("Chest Pain — HEART-style risk, rule-in/out ACS"):
-        user_q = (
-            "58F with chest pressure, risk factors HTN/HLD, non-ischemic ECG, initial hs-troponin negative. "
-            "HEART ~4. What’s the most value-based next step—serial troponins/obs vs stress vs CTCA?"
-        )
-        st.session_state["messages"].append({"role":"user","content":user_q})
-        with st.chat_message("user"): st.markdown(user_q)
-        run_case(user_q)
-
-    if st.button("UGIB — Stable, timing of EGD"):
-        user_q = (
-            "62M with melena, Hgb 8.9, MAP 74 but stable after 1U PRBC. No cirrhosis history. "
-            "Should I push for urgent EGD now vs early morning? Imaging needed?"
-        )
-        st.session_state["messages"].append({"role":"user","content":user_q})
-        with st.chat_message("user"): st.markdown(user_q)
-        run_case(user_q)
-
-    if st.button("AKI Oliguria — FST vs Early RRT"):
+        st.rerun()
+    
+    if st.button("📍 AKI Oliguria — FST vs Early RRT", use_container_width=True):
         user_q = (
             "ICU patient oliguric post-sepsis; Cr 2.7 (baseline 1.0), K 5.3, HCO3 18. "
             "POCUS: VExUS 2, no hydronephrosis; bladder 80 mL. Should I do FST, and when to start CRRT?"
         )
         st.session_state["messages"].append({"role":"user","content":user_q})
-        with st.chat_message("user"): st.markdown(user_q)
-        run_case(user_q)
-
-    if st.button("CAP — Low Risk (avoid low-EVI testing)"):
+        st.rerun()
+    
+    st.markdown("### ❤️ Cardiology")
+    if st.button("📍 Chest Pain — HEART score approach", use_container_width=True):
         user_q = (
-            "68M with CAP on CXR, SpO2 93% RA, mild COPD, no chest pain. "
-            "Should I order CT chest or stick with CXR + procalcitonin and narrow antibiotics?"
+            "58F with chest pressure, risk factors HTN/HLD, non-ischemic ECG, initial hs-troponin negative. "
+            "HEART score ~4. Serial troponins vs stress test vs CTCA?"
         )
         st.session_state["messages"].append({"role":"user","content":user_q})
-        with st.chat_message("user"): st.markdown(user_q)
-        run_case(user_q)
+        st.rerun()
+    
+    st.markdown("### 🩸 Gastroenterology")
+    if st.button("📍 UGIB — EGD timing decision", use_container_width=True):
+        user_q = (
+            "62M with melena, Hgb 8.9, MAP 74 stable after 1U PRBC. No cirrhosis history. "
+            "Push for urgent EGD now vs early morning? Imaging needed?"
+        )
+        st.session_state["messages"].append({"role":"user","content":user_q})
+        st.rerun()
+    
+    st.markdown("---")
+    st.markdown("### 🔧 Session Controls")
+    if st.button("🆕 Clear Chat History", use_container_width=True):
+        st.session_state["messages"] = []
+        st.rerun()
+    
+    st.markdown("---")
+    st.caption("💡 **How to use:**\n1. Click an auto-prompt\n2. Or type your own case below\n3. Get Bayesian reasoning + EVI + Cost analysis")
 
-# Free-text chat input
-if user_free := st.chat_input("Enter your clinical query..."):
+# Main chat area
+st.subheader("💬 Clinical Conversation")
+
+# Display chat history
+for m in st.session_state["messages"]:
+    with st.chat_message(m["role"]):
+        if m["role"] == "user":
+            st.markdown(m["content"])
+        else:
+            # For assistant messages, just show the content
+            # (structured tables are regenerated in run_case)
+            st.markdown(m["content"])
+
+# Process any pending user message from auto-prompt
+if st.session_state["messages"] and st.session_state["messages"][-1]["role"] == "user":
+    last_user_msg = st.session_state["messages"][-1]["content"]
+    # Check if we've already responded to this
+    if len(st.session_state["messages"]) == 1 or st.session_state["messages"][-2]["role"] != "assistant":
+        run_case(last_user_msg)
+
+# Chat input
+if user_free := st.chat_input("💬 Enter your clinical question or case details..."):
+    # Add to history
     st.session_state["messages"].append({"role": "user", "content": user_free})
+    
+    # Display user message
     with st.chat_message("user"):
         st.markdown(user_free)
+    
+    # Process and respond
     run_case(user_free)
+
+# Footer
+st.markdown("---")
+st.caption("⚠️ **Disclaimer:** PRIORI is an MVP demonstration tool for educational/research purposes. Not for clinical use. All recommendations require physician oversight.")

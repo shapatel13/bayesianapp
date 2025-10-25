@@ -1,35 +1,29 @@
-# app_priori_auto.py
-# Minimal, auto-driven PRIORI (Hybrid Clinical Mode)
-# - Keeps your model & API key EXACTLY as-is
-# - No user toggles; the LLM supplies LRs, costs, EVI & Utility
-# - Parses a JSON tail to show structured results automatically
+# app_priori_auto_router.py
+# PRIORI — Auto-parameters + Auto-Policy Routing + Digestible Output
+# - Keeps your SAME model & API key
+# - No toggles for the user
+# - Policy router adds scenario-specific context before calling the agent
+# - Math hidden; digestible "Clinical TL;DR" shown; details in an expander
 
 import re
 import json
-from typing import List, Dict
+from typing import Dict
 
 import streamlit as st
 from agno.agent import Agent
 from agno.models.google import Gemini
 
-# --- Configuration & Setup (kept as-is for your testing) ---
+# --- Configuration & Setup (unchanged for your testing) ---
 try:
     API_KEY = 'AIzaSyDmcPbEDAEojTomYs7vLKu107fOa7c6500'
 except (FileNotFoundError, KeyError):
     st.error("API Key not found. Please create a .streamlit/secrets.toml file with your API_KEY.")
     st.stop()
 
-# ---------- Helper: extract last fenced JSON block from model output ----------
-JSON_BLOCK_PATTERN = re.compile(
-    r"```(?:json)?\s*(\{.*?\})\s*```",
-    re.DOTALL | re.IGNORECASE
-)
+# ---------- JSON tail extractor ----------
+JSON_BLOCK_PATTERN = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
 
 def extract_json_tail(text: str) -> Dict:
-    """
-    Extract the last fenced code block that parses as JSON.
-    Return {} if not found or parsing fails.
-    """
     matches = JSON_BLOCK_PATTERN.findall(text or "")
     for raw in reversed(matches):
         try:
@@ -38,142 +32,187 @@ def extract_json_tail(text: str) -> Dict:
             continue
     return {}
 
-# ---------- Agent Instructions (LLM supplies LRs, costs, EVI, Utility) ----------
+# ---------- Lightweight policy router ----------
+def detect_policy(user_text: str) -> str:
+    t = (user_text or "").lower()
+    if any(k in t for k in ["pulmonary embol", "pe ", " pe.", "well", "perc", "d-dimer", "d dimer"]):
+        return "PE"
+    if any(k in t for k in ["pneumonia", "cap", "community-acquired", "infiltrate", "procalcitonin"]):
+        return "CAP"
+    if any(k in t for k in ["septic shock", "sepsis", "norepinephrine", "vasopressin", "vexus", "plr", "capillary refill"]):
+        return "SEPSIS"
+    if any(k in t for k in ["aki", "oligur", "furosemide stress", "fst", "dialysis", "crrt"]):
+        return "AKI"
+    if any(k in t for k in ["gi bleed", "hematemesis", "melena", "varice", "egd", "octreotide"]):
+        return "UGIB"
+    return "GEN"
+
+# Scenario-specific priors/thresholds cue (concise, for the LLM to reason with)
+POLICY_CONTEXT = {
+    "PE": """Scenario: Pulmonary Embolism rule-in/out.
+- Use Wells/PERC intuition; D-dimer useful in low/mod risk; CTA only when posterior remains above threshold.
+- Prefer avoiding CTA if EVI low. Costs (US approx): CTA $500–$800; D-dimer $15–$40.
+- Safety: anticoagulate only if posterior high / imaging positive or high clinical suspicion with instability.""",
+    "CAP": """Scenario: Community-acquired pneumonia (floor).
+- Favor CXR + procalcitonin, avoid CT unless atypical course.
+- Narrow/shorten antibiotics at 48–72h if improving (5 days typical).
+- Costs (US approx): CT chest $500–$700; daily broad labs $150–$300; broad abx/day $70–$150; narrow/day ~$20–$40.""",
+    "SEPSIS": """Scenario: Septic shock (ICU).
+- Early norepinephrine if MAP<65 after ≤1–2L; PLR/VExUS to guide fluids.
+- Balanced crystalloids preferred; add vasopressin when NE ~0.25–0.5 µg/kg/min; steroids if pressor-dependent.
+- Costs approx: 500 mL crystalloids ~$8; day-1 NE ~$25; CT chest/abd ~$500–$700. Avoid low-EVI imaging early.""",
+    "AKI": """Scenario: Oliguric AKI after sepsis.
+- Rule out obstruction (renal/bladder US). If VExUS≥2, avoid fluids; FST (1–1.5 mg/kg) stratifies RRT risk.
+- Start CRRT only for AEIOU or progression.
+- Costs approx: FST ~$2; US bedside ~$35; CRRT/day ~$1600; daily labs ~$150–$300.""",
+    "UGIB": """Scenario: Upper GI bleed (ICU).
+- PPI + resuscitation first. Add octreotide + ceftriaxone only if variceal probability high.
+- Urgent EGD ≤12h once stable; avoid CT unless perforation/unclear source post-EGD.
+- Costs approx: PPI infusion ~$35; octreotide day ~$85; urgent EGD ~$1100; CT abd ~$500–$700.""",
+    "GEN": """Scenario: General inpatient reasoning.
+- Reduce uncertainty (Bayes), avoid low-value tests (EVI), choose highest-utility action (Benefit−Harm−Cost).
+- Use reasonable US costs and mark approximations; keep one clear recommendation."""
+}
+
+# ---------- Agent Instructions (digestible output, math hidden) ----------
 HYBRID_INSTRUCTIONS = """
 You are PRIORI — a Bayesian clinical rounding assistant for inpatient/ICU care.
-Tone: professional, collegial, concise. Show math lightly unless asked. Use internal medical knowledge
-to supply missing parameters (likelihood ratios, costs, typical US hospital ranges) and state assumptions.
+Tone: professional, collegial, concise. Use internal medical knowledge to supply LRs and US cost ranges; mark approximations.
+Do all math silently; present an easy-to-digest summary. Keep one clear recommendation.
 
-Goals:
-- Reduce uncertainty (Bayes), avoid low-value tests (EVI), choose best next step (Utility).
-- If precise LR/cost is unknown, provide a reasonable range and mark as "approx" with a short basis.
-- Keep one clear recommendation; provide alternatives concisely.
-- Never request the user to toggle parameters; you must infer reasonable values.
-
-Required sections (Markdown):
+Required sections (Markdown, concise):
 
 **Executive Summary:** One bold sentence with the key clinical conclusion (posterior + next action).
 
+### Clinical TL;DR (for bedside)
+- Posterior: X%
+- Do now: single best next step (plain language)
+- Why: 2–3 bullets (Bayes → EVI → Utility)
+
+*(Math below is optional for readers)*
+
+<details>
+<summary>Details (math & rationale)</summary>
+
 ### 1) Pre-Test Probability
-- Initial estimate (%), with a brief rationale (validated rule or gestalt).
-- Key priors/assumptions (one line).
+- Initial estimate (%), with brief rationale (rule or gestalt). Assumptions (one line).
 
 ### 2) Evidence Update (LR Table)
 | Finding/Test | Result | LR (or LR+/LR−) | Source/Note |
 |---|---:|---:|---|
 | ... | ... | ... | ... |
 
-(If LR is approximate, show a reasonable range and mark "approx".)
-
 ### 3) Post-Test Probability (quiet math)
-- Pre-odds × LR product → Post-odds → Posterior (%). Keep concise.
+- Pre-odds × LR product → Post-odds → Posterior (%).
 
 ### 4) Decision & Rationale (Bayes → EVI → Utility)
-- **Recommendation:** the single best next action.
+- **Recommendation:** single best action.
 - Why now: link Bayes (posterior) → EVI (will testing change management?) → Utility (benefit−harm−cost).
-- Include simple US cost estimates (mean $ and uncertainty) for the few key actions you considered.
+- Include simple US cost estimates (mean $ and uncertainty) for key actions.
 - Safety overrides (if any).
 - Devil’s advocate (one-line alternative).
+
+</details>
 
 ### 5) JSON (machine-readable)
 Return a fenced JSON block with:
 {
   "posterior": 0.xx,
   "evi_table": [
-    {"test":"CT Chest","p_change":0.xx,"value_if_change":0.xx,"evi":0.xx},
-    {"test":"Procalcitonin","p_change":0.xx,"value_if_change":0.xx,"evi":0.xx}
+    {"test":"...","p_change":0.xx,"value_if_change":0.xx,"evi":0.xx}
   ],
   "costs": [
-    {"item":"CT Chest","mean_usd":600,"note":"approx US inpatient"},
-    {"item":"Daily Labs","mean_usd":300,"note":"approx bundle"}
+    {"item":"...","mean_usd":123,"note":"approx US"}
   ],
   "utility_rank": [
-    {"action":"Defer CT; re-eval in 12–24h","benefit":0.xx,"harm":0.xx,"cost_usd":0,"utility":0.xx},
-    {"action":"Continue broad Abx 24h then narrow","benefit":0.xx,"harm":0.xx,"cost_usd":100,"utility":0.xx},
-    {"action":"Order CT Chest","benefit":0.xx,"harm":0.xx,"cost_usd":600,"utility":0.xx}
-  ]
+    {"action":"...","benefit":0.xx,"harm":0.xx,"cost_usd":123,"utility":0.xx}
+  ],
+  "best_action": "plain-language single action"
 }
-- Ensure keys and numeric types are valid JSON. Do not include comments in the JSON.
+Ensure valid JSON (no comments) in the final fenced block.
 """
 
 clinical_reasoner = Agent(
     name="PRIORI",
     model=Gemini(id="gemini-2.5-flash", api_key=API_KEY),  # <-- unchanged
     markdown=True,
-    description="PRIORI: Bayesian + EVI + Utility bedside reasoning partner (hybrid clinical mode, auto-parameters).",
+    description="PRIORI: Bayesian + EVI + Utility bedside reasoning partner (auto-parameters, policy-routed).",
     instructions=[HYBRID_INSTRUCTIONS],
 )
 
 # ---------- UI ----------
-st.set_page_config(page_title="PRIORI — Bayesian/EVI/Utility (Auto)", page_icon="🩺", layout="wide")
-st.title("🩺 PRIORI — Bayesian • EVI • Utility (Auto-Parameters)")
-st.caption("Zero knobs. The model supplies LRs, costs, EVI & Utility with explicit assumptions.")
+st.set_page_config(page_title="PRIORI — Bayesian/EVI/Utility (Auto + Routed)", page_icon="🩺", layout="wide")
+st.title("🩺 PRIORI — Bayesian • EVI • Utility")
+st.caption("Math in the background. Clinician-ready output up front.")
 
-with st.sidebar:
-    st.header("Session")
-    if st.button("🔄 New Case"):
-        st.session_state.clear()
-        st.rerun()
-    st.markdown("**Examples**")
-    st.code("68M CAP on room air (SpO₂ 93%), low Wells, mild dyspnea. Should I order CT PE?")
-    st.code("ED anemia + melena, Hgb 8.1 but stable. What next? Imaging vs endoscopy timing?")
-    st.code("ICU oliguric AKI day 1 post-sepsis. FST vs early RRT?")
-
-# Display history
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
 
+# Show history
 for m in st.session_state["messages"]:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-# Chat input
-if prompt := st.chat_input("Enter your clinical query..."):
-    st.session_state["messages"].append({"role": "user", "content": prompt})
+# Input
+if user_q := st.chat_input("Enter your clinical query..."):
+    st.session_state["messages"].append({"role": "user", "content": user_q})
     with st.chat_message("user"):
-        st.markdown(prompt)
+        st.markdown(user_q)
+
+    # Build routed context
+    policy = detect_policy(user_q)
+    preface = f"Policy: {policy}\n\n{POLICY_CONTEXT.get(policy,'')}\n\nUser question:\n"
+    routed_prompt = preface + user_q
 
     # Call agent
     with st.chat_message("assistant"):
         with st.spinner("Reasoning..."):
             try:
-                run = clinical_reasoner.run(prompt)
+                run = clinical_reasoner.run(routed_prompt)
                 content = run.content
 
-                # Show narrative
-                st.markdown(content)
+                # Render model narrative (already digestible; details hidden in HTML <details>)
+                st.markdown(content, unsafe_allow_html=True)
 
-                # Try to parse the JSON tail and render structured tables
+                # Parse JSON tail
                 data = extract_json_tail(content)
 
+                # Render a clean “Clinical TL;DR” card synthesized from JSON (if available)
                 if data:
+                    best = data.get("best_action")
+                    posterior = data.get("posterior")
+                    if posterior is not None or best:
+                        st.divider()
+                        st.subheader("Clinical TL;DR (auto)")
+                        cols = st.columns(3)
+                        if posterior is not None:
+                            cols[0].metric("Posterior", f"{float(posterior)*100:.1f}%")
+                        if best:
+                            cols[1].markdown(f"**Do now:** {best}")
+                        # Pull the top utility item for a rationale bullet
+                        if data.get("utility_rank"):
+                            top = sorted(data["utility_rank"], key=lambda x: x.get("utility", 0.0), reverse=True)[0]
+                            cols[2].markdown(f"**Why:** {top.get('action','Best action')} has the highest utility.")
+
+                    # Structured tables (auto)
                     st.divider()
                     st.subheader("Structured Summary")
-                    col1, col2 = st.columns(2)
-
-                    with col1:
-                        if "posterior" in data:
-                            st.metric("Posterior (from agent)", f"{float(data['posterior'])*100:.1f}%")
-
-                        if "evi_table" in data and isinstance(data["evi_table"], list) and data["evi_table"]:
-                            st.markdown("**EVI (Expected Value of Information)**")
-                            st.table({
-                                "Test": [x.get("test","") for x in data["evi_table"]],
-                                "ΔP": [round(float(x.get("p_change",0.0)), 3) for x in data["evi_table"]],
-                                "Value(if change)": [round(float(x.get("value_if_change",0.0)), 3) for x in data["evi_table"]],
-                                "EVI": [round(float(x.get("evi",0.0)), 3) for x in data["evi_table"]],
-                            })
-
-                    with col2:
-                        if "costs" in data and isinstance(data["costs"], list) and data["costs"]:
-                            st.markdown("**Cost Snapshot (US, approx)**")
-                            st.table({
-                                "Item": [x.get("item","") for x in data["costs"]],
-                                "Mean $": [x.get("mean_usd","") for x in data["costs"]],
-                                "Note": [x.get("note","") for x in data["costs"]],
-                            })
-
-                    if "utility_rank" in data and isinstance(data["utility_rank"], list) and data["utility_rank"]:
+                    if data.get("evi_table"):
+                        st.markdown("**EVI (Expected Value of Information)**")
+                        st.table({
+                            "Test": [x.get("test","") for x in data["evi_table"]],
+                            "ΔP": [round(float(x.get("p_change",0.0)), 3) for x in data["evi_table"]],
+                            "Value(if change)": [round(float(x.get("value_if_change",0.0)), 3) for x in data["evi_table"]],
+                            "EVI": [round(float(x.get("evi",0.0)), 3) for x in data["evi_table"]],
+                        })
+                    if data.get("costs"):
+                        st.markdown("**Cost Snapshot (US, approx)**")
+                        st.table({
+                            "Item": [x.get("item","") for x in data["costs"]],
+                            "Mean $": [x.get("mean_usd","") for x in data["costs"]],
+                            "Note": [x.get("note","") for x in data["costs"]],
+                        })
+                    if data.get("utility_rank"):
                         st.markdown("**Utility Ranking (Higher = better value)**")
                         st.table({
                             "Action": [x.get("action","") for x in data["utility_rank"]],
@@ -183,7 +222,7 @@ if prompt := st.chat_input("Enter your clinical query..."):
                             "Utility": [round(float(x.get("utility",0.0)),3) for x in data["utility_rank"]],
                         })
 
-                # Save assistant message
+                # Save to history
                 st.session_state["messages"].append({"role": "assistant", "content": content})
 
             except Exception as e:

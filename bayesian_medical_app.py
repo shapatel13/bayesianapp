@@ -1,6 +1,11 @@
-# app_priori_hybrid.py
-import math
-from dataclasses import dataclass
+# app_priori_auto.py
+# Minimal, auto-driven PRIORI (Hybrid Clinical Mode)
+# - Keeps your model & API key EXACTLY as-is
+# - No user toggles; the LLM supplies LRs, costs, EVI & Utility
+# - Parses a JSON tail to show structured results automatically
+
+import re
+import json
 from typing import List, Dict
 
 import streamlit as st
@@ -14,94 +19,59 @@ except (FileNotFoundError, KeyError):
     st.error("API Key not found. Please create a .streamlit/secrets.toml file with your API_KEY.")
     st.stop()
 
-# -----------------------------
-# Bayes / EVI / Utility helpers
-# -----------------------------
-def _clip01(x: float) -> float:
-    return max(1e-6, min(1 - 1e-6, x))
+# ---------- Helper: extract last fenced JSON block from model output ----------
+JSON_BLOCK_PATTERN = re.compile(
+    r"```(?:json)?\s*(\{.*?\})\s*```",
+    re.DOTALL | re.IGNORECASE
+)
 
-def prob_to_odds(p: float) -> float:
-    p = _clip01(p)
-    return p / (1 - p)
-
-def odds_to_prob(o: float) -> float:
-    return o / (1 + o)
-
-def bayes_update(pretest_p: float, lrs: List[float]) -> float:
-    """Multiply LRs (assumes conditional independence for MVP) and update probability."""
-    pre_odds = prob_to_odds(pretest_p)
-    lr_prod = 1.0
-    for lr in lrs:
+def extract_json_tail(text: str) -> Dict:
+    """
+    Extract the last fenced code block that parses as JSON.
+    Return {} if not found or parsing fails.
+    """
+    matches = JSON_BLOCK_PATTERN.findall(text or "")
+    for raw in reversed(matches):
         try:
-            lr_val = float(lr)
-        except:
-            lr_val = 1.0
-        lr_prod *= max(lr_val, 1e-6)
-    post_odds = pre_odds * lr_prod
-    return odds_to_prob(post_odds)
+            return json.loads(raw)
+        except Exception:
+            continue
+    return {}
 
-def evi_for_test(posterior: float, pretest: float, value_if_change: float = 0.5) -> float:
-    """
-    MVP proxy for Expected Value of Information:
-    EVI = |ΔP| * value_if_change
-    where |ΔP| is the absolute probability shift after the test and
-    value_if_change is a unitless 0–1 knob for how valuable a decision change would be.
-    """
-    dp = abs(_clip01(posterior) - _clip01(pretest))
-    return max(0.0, dp) * max(0.0, min(1.0, value_if_change))
-
-def utility(benefit: float, harm: float, cost_usd: float, harm_weight: float = 0.2) -> float:
-    """
-    Utility = Benefit − (harm_weight × Harm) − (Cost / 100)
-    Units are relative 'utility points'. Keep simple and comparable across options.
-    """
-    return float(benefit) - (float(harm_weight) * float(harm)) - (float(cost_usd) / 100.0)
-
-# -----------------------------
-# Simple cost priors (editable in sidebar)
-# -----------------------------
-@dataclass
-class CostItem:
-    name: str
-    mean_usd: float
-    risk_weight: float  # small proxy for harm
-    ops_friction: float # workflow penalty (0–0.3)
-
-DEFAULT_COSTS: Dict[str, CostItem] = {
-    "ct_chest": CostItem("CT Chest", 600, 0.05, 0.25),
-    "daily_labs": CostItem("Broad Daily Labs", 300, 0.02, 0.05),
-    "broad_abx_day": CostItem("Broad Antibiotics (per day)", 100, 0.03, 0.10),
-    "narrow_abx_day": CostItem("Narrow Antibiotics (per day)", 30, 0.01, 0.05),
-    "balanced_crystalloid_500": CostItem("Balanced Crystalloid 500 mL", 8, 0.01, 0.02),
-}
-
-# -----------------------------
-# Agent Definition (Hybrid Clinical Mode)
-# -----------------------------
+# ---------- Agent Instructions (LLM supplies LRs, costs, EVI, Utility) ----------
 HYBRID_INSTRUCTIONS = """
 You are PRIORI — a Bayesian clinical rounding assistant for inpatient/ICU care.
-Keep a professional, collegial tone; be concise and structured. Show math lightly (quiet background),
-but expose it when asked. Combine Bayesian updating, EVI for tests, and Utility ranking for actions.
+Tone: professional, collegial, concise. Show math lightly unless asked. Use internal medical knowledge
+to supply missing parameters (likelihood ratios, costs, typical US hospital ranges) and state assumptions.
 
-ALWAYS respond using this Markdown scaffold (short, clinical, readable):
+Goals:
+- Reduce uncertainty (Bayes), avoid low-value tests (EVI), choose best next step (Utility).
+- If precise LR/cost is unknown, provide a reasonable range and mark as "approx" with a short basis.
+- Keep one clear recommendation; provide alternatives concisely.
+- Never request the user to toggle parameters; you must infer reasonable values.
 
-**Executive Summary:** One bold sentence with the key clinical conclusion (probability + next step).
+Required sections (Markdown):
+
+**Executive Summary:** One bold sentence with the key clinical conclusion (posterior + next action).
 
 ### 1) Pre-Test Probability
 - Initial estimate (%), with a brief rationale (validated rule or gestalt).
 - Key priors/assumptions (one line).
 
 ### 2) Evidence Update (LR Table)
-| Finding/Test | Result | LR (or LR+/LR−) | Note |
+| Finding/Test | Result | LR (or LR+/LR−) | Source/Note |
 |---|---:|---:|---|
 | ... | ... | ... | ... |
 
+(If LR is approximate, show a reasonable range and mark "approx".)
+
 ### 3) Post-Test Probability (quiet math)
-- Pre-odds × LR product → Post-odds → Posterior (%).
+- Pre-odds × LR product → Post-odds → Posterior (%). Keep concise.
 
 ### 4) Decision & Rationale (Bayes → EVI → Utility)
 - **Recommendation:** the single best next action.
 - Why now: link Bayes (posterior) → EVI (will testing change management?) → Utility (benefit−harm−cost).
+- Include simple US cost estimates (mean $ and uncertainty) for the few key actions you considered.
 - Safety overrides (if any).
 - Devil’s advocate (one-line alternative).
 
@@ -109,130 +79,114 @@ ALWAYS respond using this Markdown scaffold (short, clinical, readable):
 Return a fenced JSON block with:
 {
   "posterior": 0.xx,
-  "evi_table": [{"test":"...", "evi": 0.xx}],
-  "utility_rank": [{"action":"...", "utility": 0.xx}]
+  "evi_table": [
+    {"test":"CT Chest","p_change":0.xx,"value_if_change":0.xx,"evi":0.xx},
+    {"test":"Procalcitonin","p_change":0.xx,"value_if_change":0.xx,"evi":0.xx}
+  ],
+  "costs": [
+    {"item":"CT Chest","mean_usd":600,"note":"approx US inpatient"},
+    {"item":"Daily Labs","mean_usd":300,"note":"approx bundle"}
+  ],
+  "utility_rank": [
+    {"action":"Defer CT; re-eval in 12–24h","benefit":0.xx,"harm":0.xx,"cost_usd":0,"utility":0.xx},
+    {"action":"Continue broad Abx 24h then narrow","benefit":0.xx,"harm":0.xx,"cost_usd":100,"utility":0.xx},
+    {"action":"Order CT Chest","benefit":0.xx,"harm":0.xx,"cost_usd":600,"utility":0.xx}
+  ]
 }
+- Ensure keys and numeric types are valid JSON. Do not include comments in the JSON.
 """
 
 clinical_reasoner = Agent(
     name="PRIORI",
-    model=Gemini(id="gemini-2.5-flash", api_key=API_KEY),  # <-- kept exactly as you had it
+    model=Gemini(id="gemini-2.5-flash", api_key=API_KEY),  # <-- unchanged
     markdown=True,
-    description="PRIORI: Bayesian + EVI + Utility bedside reasoning partner (hybrid clinical mode).",
+    description="PRIORI: Bayesian + EVI + Utility bedside reasoning partner (hybrid clinical mode, auto-parameters).",
     instructions=[HYBRID_INSTRUCTIONS],
 )
 
-# -----------------------------
-# App Logic / UI
-# -----------------------------
-def initialize_chat_history():
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    if "conversation_history" not in st.session_state:
-        st.session_state.conversation_history = []
+# ---------- UI ----------
+st.set_page_config(page_title="PRIORI — Bayesian/EVI/Utility (Auto)", page_icon="🩺", layout="wide")
+st.title("🩺 PRIORI — Bayesian • EVI • Utility (Auto-Parameters)")
+st.caption("Zero knobs. The model supplies LRs, costs, EVI & Utility with explicit assumptions.")
 
-def format_message_for_agent(role: str, content: str) -> dict:
-    return {"role": "user" if role == "user" else "assistant", "content": content}
-
-st.set_page_config(page_title="PRIORI — Bayesian/EVI/Utility (Hybrid)", page_icon="🩺", layout="wide")
-initialize_chat_history()
-st.title("🩺 PRIORI — Bayesian • EVI • Utility (Hybrid Clinical Mode)")
-st.markdown("> **Bayes narrows uncertainty. EVI prevents waste. Utility chooses the best next step.**")
-
-# Sidebar: controls for simple costs/weights and a mini Bayes/EVI sandbox
 with st.sidebar:
     st.header("Session")
     if st.button("🔄 New Case"):
-        st.session_state.messages, st.session_state.conversation_history = [], []
+        st.session_state.clear()
         st.rerun()
+    st.markdown("**Examples**")
+    st.code("68M CAP on room air (SpO₂ 93%), low Wells, mild dyspnea. Should I order CT PE?")
+    st.code("ED anemia + melena, Hgb 8.1 but stable. What next? Imaging vs endoscopy timing?")
+    st.code("ICU oliguric AKI day 1 post-sepsis. FST vs early RRT?")
 
-    st.header("Cost / Risk Tuners")
-    ct_cost = st.slider("CT Chest ($)", 200, 1200, int(DEFAULT_COSTS["ct_chest"].mean_usd), 50)
-    labs_cost = st.slider("Broad Daily Labs ($)", 50, 600, int(DEFAULT_COSTS["daily_labs"].mean_usd), 25)
-    abx_cost = st.slider("Broad Abx / day ($)", 40, 200, int(DEFAULT_COSTS["broad_abx_day"].mean_usd), 10)
-    harm_weight = st.slider("Global Harm Weight (0–1)", 0.0, 1.0, 0.2, 0.05)
+# Display history
+if "messages" not in st.session_state:
+    st.session_state["messages"] = []
 
-    # Update runtime costs
-    DEFAULT_COSTS["ct_chest"].mean_usd = float(ct_cost)
-    DEFAULT_COSTS["daily_labs"].mean_usd = float(labs_cost)
-    DEFAULT_COSTS["broad_abx_day"].mean_usd = float(abx_cost)
-
-    st.header("Quick Bayes/EVI Sandbox")
-    pretest_pct = st.slider("Pre-test probability (%)", 0.0, 100.0, 10.0, 1.0)
-    lrs_csv = st.text_input("LRs (comma-separated)", "0.3")
-    try:
-        lr_list = [float(x.strip()) for x in lrs_csv.split(",") if x.strip()]
-    except:
-        lr_list = [1.0]
-    posterior_demo = bayes_update(pretest_pct/100.0, lr_list)
-    st.write(f"Posterior (demo): **{posterior_demo*100:.1f}%**")
-    value_if_change = st.slider("Value(if decision changes) 0–1", 0.0, 1.0, 0.5, 0.05)
-    st.write(f"EVI proxy: **{evi_for_test(posterior_demo, pretest_pct/100.0, value_if_change):.2f}**")
-
-    st.header("Examples")
-    st.markdown("""
-    - *ED CAP, low Wells, mild dyspnea — Should I order CT PE?*  
-    - *ICU septic shock after 1L; PLR−, VExUS 2 — Fluids or pressor?*
-    """)
-
-# Chat history
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+for m in st.session_state["messages"]:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
 
 # Chat input
 if prompt := st.chat_input("Enter your clinical query..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    st.session_state.conversation_history.append(format_message_for_agent("user", prompt))
+    st.session_state["messages"].append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
+    # Call agent
     with st.chat_message("assistant"):
         with st.spinner("Reasoning..."):
             try:
-                # Run the agent
-                response = clinical_reasoner.run(prompt, messages=st.session_state.conversation_history)
-                response_content = response.content
+                run = clinical_reasoner.run(prompt)
+                content = run.content
 
-                # ---- Optional: add a small local utility snapshot (illustrative only) ----
-                ct = DEFAULT_COSTS["ct_chest"]
-                labs = DEFAULT_COSTS["daily_labs"]
-                abx = DEFAULT_COSTS["broad_abx_day"]
+                # Show narrative
+                st.markdown(content)
 
-                # MVP illustrative benefits/harms (engineers should tune per scenario)
-                actions = [
-                    ("Defer Imaging; Re-evaluate in 12–24h", utility(benefit=0.35, harm=0.02, cost_usd=0, harm_weight=harm_weight)),
-                    ("Continue Broad Abx 24h then Reassess", utility(benefit=0.40, harm=abx.risk_weight, cost_usd=abx.mean_usd, harm_weight=harm_weight)),
-                    ("Order Broad Daily Labs", utility(benefit=0.10, harm=labs.risk_weight, cost_usd=labs.mean_usd, harm_weight=harm_weight)),
-                    ("Order CT Chest", utility(benefit=0.10, harm=ct.risk_weight, cost_usd=ct.mean_usd, harm_weight=harm_weight)),
-                ]
-                actions_sorted = sorted(actions, key=lambda x: x[1], reverse=True)
+                # Try to parse the JSON tail and render structured tables
+                data = extract_json_tail(content)
 
-                # Display the agent result
-                st.markdown(response_content)
+                if data:
+                    st.divider()
+                    st.subheader("Structured Summary")
+                    col1, col2 = st.columns(2)
 
-                # Display compact local utility table for transparency
-                st.markdown("#### Local Utility Snapshot (MVP — adjustable weights)")
-                st.table(
-                    {
-                        "Action": [a for a, _ in actions_sorted],
-                        "Utility (relative)": [round(u, 2) for _, u in actions_sorted],
-                    }
-                )
+                    with col1:
+                        if "posterior" in data:
+                            st.metric("Posterior (from agent)", f"{float(data['posterior'])*100:.1f}%")
 
-                # Save to history
-                st.session_state.messages.append({"role": "assistant", "content": response_content})
-                st.session_state.conversation_history.append(
-                    format_message_for_agent("assistant", response_content)
-                )
+                        if "evi_table" in data and isinstance(data["evi_table"], list) and data["evi_table"]:
+                            st.markdown("**EVI (Expected Value of Information)**")
+                            st.table({
+                                "Test": [x.get("test","") for x in data["evi_table"]],
+                                "ΔP": [round(float(x.get("p_change",0.0)), 3) for x in data["evi_table"]],
+                                "Value(if change)": [round(float(x.get("value_if_change",0.0)), 3) for x in data["evi_table"]],
+                                "EVI": [round(float(x.get("evi",0.0)), 3) for x in data["evi_table"]],
+                            })
+
+                    with col2:
+                        if "costs" in data and isinstance(data["costs"], list) and data["costs"]:
+                            st.markdown("**Cost Snapshot (US, approx)**")
+                            st.table({
+                                "Item": [x.get("item","") for x in data["costs"]],
+                                "Mean $": [x.get("mean_usd","") for x in data["costs"]],
+                                "Note": [x.get("note","") for x in data["costs"]],
+                            })
+
+                    if "utility_rank" in data and isinstance(data["utility_rank"], list) and data["utility_rank"]:
+                        st.markdown("**Utility Ranking (Higher = better value)**")
+                        st.table({
+                            "Action": [x.get("action","") for x in data["utility_rank"]],
+                            "Benefit": [round(float(x.get("benefit",0.0)),3) for x in data["utility_rank"]],
+                            "Harm": [round(float(x.get("harm",0.0)),3) for x in data["utility_rank"]],
+                            "Cost ($)": [x.get("cost_usd","") for x in data["utility_rank"]],
+                            "Utility": [round(float(x.get("utility",0.0)),3) for x in data["utility_rank"]],
+                        })
+
+                # Save assistant message
+                st.session_state["messages"].append({"role": "assistant", "content": content})
+
             except Exception as e:
-                response_content = f"An error occurred: {str(e)}"
-                st.error(response_content)
-                st.session_state.messages.append({"role": "assistant", "content": response_content})
-                st.session_state.conversation_history.append(
-                    format_message_for_agent("assistant", response_content)
-                )
-
-if __name__ == "__main__":
-    # Streamlit runs this file directly
-    pass
+                err = f"An error occurred: {str(e)}"
+                st.error(err)
+                st.session_state["messages"].append({"role": "assistant", "content": err})

@@ -760,8 +760,7 @@ def process_with_llm(patient_query: str) -> Tuple[str, Dict]:
     try:
         # Initialize Agno agent with Gemini
         agent = Agent(
-            model=Gemini(id="gemini-2.0-flash-exp"),
-            api_key=API_KEY,
+            model=Gemini(id="gemini-2.0-flash-exp", api_key=API_KEY),
             markdown=True
         )
         

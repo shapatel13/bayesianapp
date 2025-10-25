@@ -7,7 +7,8 @@ from dataclasses import dataclass
 import plotly.graph_objects as go
 import plotly.express as px
 from scipy import stats
-from agno import Agno
+from agno.agent import Agent
+from agno.models.google import Gemini
 
 # ============================================================================
 # CONFIGURATION
@@ -758,10 +759,9 @@ def process_with_llm(patient_query: str) -> Tuple[str, Dict]:
     """Process query with Gemini and extract structured data"""
     try:
         # Initialize Agno agent with Gemini
-        agent = Agno(
-            model="gemini-2.0-flash-exp",
+        agent = Agent(
+            model=Gemini(id="gemini-2.0-flash-exp"),
             api_key=API_KEY,
-            temperature=0.3,
             markdown=True
         )
         

@@ -74,6 +74,10 @@ def extract_json_tail(text: str) -> Dict:
             continue
     return {}
 
+def hide_json_blocks(content: str) -> str:
+    """Remove JSON code blocks from content before displaying to user."""
+    return JSON_BLOCK_PATTERN.sub("", content)
+
 # ---------- Policy router ----------
 def detect_policy(user_text: str) -> str:
     """Route query to appropriate clinical scenario context."""
@@ -213,11 +217,14 @@ def run_case(user_text: str):
                 run = clinical_reasoner.run(routed_prompt)
                 content = run.content
                 
-                # Render narrative
-                st.markdown(content, unsafe_allow_html=True)
-                
-                # Parse JSON for structured summary
+                # Parse JSON FIRST (before we hide it)
                 data = extract_json_tail(content)
+                
+                # Hide JSON blocks from user view
+                clean_content = hide_json_blocks(content)
+                
+                # Render narrative (without JSON blocks)
+                st.markdown(clean_content, unsafe_allow_html=True)
                 if data:
                     # Clinical TL;DR metrics
                     best = data.get("best_action")
@@ -276,8 +283,8 @@ def run_case(user_text: str):
                                 "Net Utility": [f"{float(x.get('utility',0.0)):.3f}" for x in data["utility_rank"]],
                             })
                 
-                # Save to history
-                st.session_state["messages"].append({"role": "assistant", "content": content})
+                # Save to history (without JSON blocks)
+                st.session_state["messages"].append({"role": "assistant", "content": clean_content})
                 
             except Exception as e:
                 st.error(f"❌ Error processing request: {str(e)}")

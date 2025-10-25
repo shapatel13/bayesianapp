@@ -74,6 +74,23 @@ def extract_json_tail(text: str) -> Dict:
             continue
     return {}
 
+def safe_float(value, default=0.0) -> float:
+    """Safely convert value to float, handling strings and errors."""
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        # Try to extract first number from string
+        import re
+        numbers = re.findall(r'-?\d+\.?\d*', value)
+        if numbers:
+            try:
+                return float(numbers[0])
+            except ValueError:
+                return default
+    return default
+
 def hide_json_blocks(content: str) -> str:
     """Remove JSON code blocks from content before displaying to user."""
     return JSON_BLOCK_PATTERN.sub("", content)
@@ -187,10 +204,17 @@ class SafetyGuardrails:
     @staticmethod
     def validate_posterior_threshold(data: dict, user_text: str) -> dict:
         """Check if treatment aligns with posterior probability."""
-        posterior = data.get("posterior")
+        posterior_raw = data.get("posterior")
         recommendation = data.get("recommendation", "") or data.get("best_action", "")
         
-        if not posterior or not recommendation:
+        if not posterior_raw or not recommendation:
+            return {"threshold_warning": False}
+        
+        # Use safe_float to handle various formats
+        from typing import TYPE_CHECKING
+        posterior = safe_float(posterior_raw)
+        
+        if posterior == 0.0:
             return {"threshold_warning": False}
         
         warnings = []
@@ -227,25 +251,29 @@ class SafetyGuardrails:
         if not utility_rank or not best_action:
             return {"mismatch": False}
         
-        # Find highest utility action
-        sorted_actions = sorted(utility_rank, key=lambda x: x.get("utility", 0), reverse=True)
-        if not sorted_actions:
+        try:
+            # Find highest utility action using safe_float
+            sorted_actions = sorted(utility_rank, key=lambda x: safe_float(x.get("utility", 0)), reverse=True)
+            if not sorted_actions:
+                return {"mismatch": False}
+            
+            top_action = sorted_actions[0].get("action", "").lower()
+            best_lower = best_action.lower()
+            
+            # Check if recommendation matches highest utility action
+            # Simple keyword overlap check
+            top_keywords = set(top_action.split())
+            best_keywords = set(best_lower.split())
+            overlap = len(top_keywords & best_keywords) / max(len(top_keywords), 1)
+            
+            if overlap < 0.3:  # Less than 30% keyword overlap
+                return {
+                    "mismatch": True,
+                    "message": f"⚠️ **INTERNAL INCONSISTENCY**: Highest utility action is '{sorted_actions[0].get('action')}' but recommendation is '{best_action}'. Review reasoning."
+                }
+        except Exception:
+            # If any error in processing, don't flag mismatch
             return {"mismatch": False}
-        
-        top_action = sorted_actions[0].get("action", "").lower()
-        best_lower = best_action.lower()
-        
-        # Check if recommendation matches highest utility action
-        # Simple keyword overlap check
-        top_keywords = set(top_action.split())
-        best_keywords = set(best_lower.split())
-        overlap = len(top_keywords & best_keywords) / max(len(top_keywords), 1)
-        
-        if overlap < 0.3:  # Less than 30% keyword overlap
-            return {
-                "mismatch": True,
-                "message": f"⚠️ **INTERNAL INCONSISTENCY**: Highest utility action is '{sorted_actions[0].get('action')}' but recommendation is '{best_action}'. Review reasoning."
-            }
         
         return {"mismatch": False}
     
@@ -419,16 +447,32 @@ NOT: Validation of existing decisions or specialty opinions.
 </details>
 
 ### Structured Output (JSON)
+**CRITICAL**: All numeric fields must contain ONLY numbers (0.15), NOT text descriptions.
 ```json
 {
-  "posterior": 0.xx,
-  "recommendation": "single action",
-  "threshold_analysis": "Treatment justified if P>X% given harm profile",
-  "evi_table": [{"test":"...","evi":0.xx}],
-  "costs": [{"item":"...","tier":"$","relative_cost":X}],
-  "utility_rank": [{"action":"...","benefit":0.xx,"harm":0.xx,"cost_tier":"$","utility":0.xx}]
+  "posterior": 0.15,
+  "recommendation": "Get D-dimer first, then CTA if positive",
+  "threshold_analysis": "Treatment justified if P>20% given bleeding risk",
+  "evi_table": [
+    {"test":"D-dimer","p_change":0.13,"value_if_change":0.50,"evi":0.065}
+  ],
+  "costs": [
+    {"item":"D-dimer","tier":"$","relative_cost":1,"note":"screening test"},
+    {"item":"CTA chest","tier":"$$$","relative_cost":40,"note":"40x more expensive"}
+  ],
+  "utility_rank": [
+    {"action":"D-dimer first","benefit":0.85,"harm":0.01,"cost_tier":"$","utility":0.84},
+    {"action":"Direct to CTA","benefit":0.88,"harm":0.02,"cost_tier":"$$$","utility":0.66}
+  ]
 }
 ```
+
+**JSON Field Requirements:**
+- "posterior": number between 0 and 1 (e.g., 0.15 for 15%)
+- "p_change", "value_if_change", "evi": numbers only
+- "benefit", "harm", "utility": numbers only
+- "relative_cost": number only (e.g., 1, 40, 500)
+- "tier", "note", "recommendation", "action": text is OK
 
 **Critical Rules:**
 - Use YOUR medical knowledge for base rates, LRs, and clinical context
@@ -501,7 +545,7 @@ The user appears to be questioning or comparing to an existing clinical plan.
                 st.markdown(clean_content, unsafe_allow_html=True)
                 if data:
                     # Clinical TL;DR metrics
-                    best = data.get("best_action")
+                    best = data.get("best_action") or data.get("recommendation")
                     posterior = data.get("posterior")
                     
                     if posterior is not None or best:
@@ -510,14 +554,19 @@ The user appears to be questioning or comparing to an existing clinical plan.
                         cols = st.columns(3)
                         
                         if posterior is not None:
-                            cols[0].metric("Posterior Probability", f"{float(posterior)*100:.1f}%")
+                            posterior_float = safe_float(posterior)
+                            if posterior_float > 0:
+                                cols[0].metric("Posterior Probability", f"{posterior_float*100:.1f}%")
                         
                         if best:
                             cols[1].markdown(f"**Recommended Action:**\n{best}")
                         
                         if data.get("utility_rank"):
-                            top = sorted(data["utility_rank"], key=lambda x: x.get("utility", 0.0), reverse=True)[0]
-                            cols[2].markdown(f"**Highest Utility:**\n{top.get('action','Best action')}")
+                            try:
+                                top = max(data["utility_rank"], key=lambda x: safe_float(x.get("utility", 0)))
+                                cols[2].markdown(f"**Highest Utility:**\n{top.get('action','Best action')}")
+                            except (ValueError, TypeError):
+                                pass
                     
                     # Structured tables
                     st.divider()
@@ -527,12 +576,15 @@ The user appears to be questioning or comparing to an existing clinical plan.
                     if data.get("evi_table"):
                         with st.expander("🔬 **Expected Value of Information (EVI)**", expanded=True):
                             st.markdown("*Which tests will actually change management?*")
-                            st.table({
-                                "Test/Intervention": [x.get("test","") for x in data["evi_table"]],
-                                "ΔP (Change in Probability)": [f"{float(x.get('p_change',0.0)):.3f}" for x in data["evi_table"]],
-                                "Value if Positive": [f"{float(x.get('value_if_change',0.0)):.3f}" for x in data["evi_table"]],
-                                "EVI Score": [f"{float(x.get('evi',0.0)):.3f}" for x in data["evi_table"]],
-                            })
+                            try:
+                                st.table({
+                                    "Test/Intervention": [x.get("test","") for x in data["evi_table"]],
+                                    "ΔP (Change in Probability)": [f"{safe_float(x.get('p_change', 0)):.3f}" for x in data["evi_table"]],
+                                    "Value if Positive": [f"{safe_float(x.get('value_if_change', 0)):.3f}" for x in data["evi_table"]],
+                                    "EVI Score": [f"{safe_float(x.get('evi', 0)):.3f}" for x in data["evi_table"]],
+                                })
+                            except Exception as e:
+                                st.info("📊 EVI data available but formatting issue detected. See detailed analysis above.")
                     
                     # Cost Comparison
                     if data.get("costs"):
@@ -549,13 +601,16 @@ The user appears to be questioning or comparing to an existing clinical plan.
                     if data.get("utility_rank"):
                         with st.expander("⚖️ **Utility Ranking (Benefit − Harm − Cost)**", expanded=True):
                             st.markdown("*Higher utility = better value for the patient*")
-                            st.table({
-                                "Action": [x.get("action","") for x in data["utility_rank"]],
-                                "Benefit": [f"{float(x.get('benefit',0.0)):.3f}" for x in data["utility_rank"]],
-                                "Harm": [f"{float(x.get('harm',0.0)):.3f}" for x in data["utility_rank"]],
-                                "Cost Tier": [x.get("cost_tier","?") for x in data["utility_rank"]],
-                                "Net Utility": [f"{float(x.get('utility',0.0)):.3f}" for x in data["utility_rank"]],
-                            })
+                            try:
+                                st.table({
+                                    "Action": [x.get("action","") for x in data["utility_rank"]],
+                                    "Benefit": [f"{safe_float(x.get('benefit', 0)):.3f}" for x in data["utility_rank"]],
+                                    "Harm": [f"{safe_float(x.get('harm', 0)):.3f}" for x in data["utility_rank"]],
+                                    "Cost Tier": [x.get("cost_tier","?") for x in data["utility_rank"]],
+                                    "Net Utility": [f"{safe_float(x.get('utility', 0)):.3f}" for x in data["utility_rank"]],
+                                })
+                            except Exception as e:
+                                st.info("⚖️ Utility ranking available but formatting issue detected. See detailed analysis above.")
                 
                 # Save to history (without JSON blocks)
                 st.session_state["messages"].append({"role": "assistant", "content": clean_content})

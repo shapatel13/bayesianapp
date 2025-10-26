@@ -465,8 +465,18 @@ class AdvancedDecisionEngine:
             # EVPI in QALYs
             evpi_qalys = max(0, ev_perfect - ev_current)
             
-            # Cost per QALY
-            test_cost = context.test_costs.get(test_name, 100)
+            # Cost per QALY - Try multiple sources for test cost
+            test_cost = context.test_costs.get(test_name, None)
+            
+            # If not in context, try COST_TIERS reference
+            if test_cost is None or test_cost == 0:
+                cost_info = get_cost_info(test_name)
+                if 'relative_cost' in cost_info and cost_info['relative_cost'] != 'unknown':
+                    # Convert relative cost to dollars (assuming baseline of $50 for relative_cost=1)
+                    test_cost = cost_info['relative_cost'] * 50
+                else:
+                    test_cost = 100  # Default fallback
+            
             cost_per_qaly = test_cost / evpi_qalys if evpi_qalys > 0 else float('inf')
             
             # Recommendation
@@ -965,13 +975,14 @@ IMPORTANT - Evidence-based time considerations:
 - Shock is the KEY distinction for urgency
 
 ## Bayesian Analysis
-Estimate:
-- Prior probability of the disease/condition (0.0 to 1.0)
-- For each relevant test, provide:
-  - Test name
-  - Sensitivity (LR+ calculation)
-  - Specificity (LR- calculation)
-  - Relative cost tier (use $ to $$$$$ scale)
+IMPORTANT: Only list tests that are being CONSIDERED (not already done).
+If a test has already been performed (e.g., CXR already positive), do NOT include it in this table.
+
+For each test being considered:
+- Test name
+- Sensitivity (for LR+ calculation)
+- Specificity (for LR- calculation)
+- Estimated cost in dollars (e.g., $50, $100, $1750)
 
 ## Clinical Outcomes (NNT/NNH)
 For the primary treatment option:
@@ -980,18 +991,27 @@ For the primary treatment option:
 - Major complication rate (as decimal, e.g., 0.02 for 2%)
 - Calculate and display NNT (Number Needed to Treat) and NNH (Number Needed to Harm)
 
-## Utility Analysis
-For each decision option (treat, test, observe), estimate:
-- Benefit score (0.0 to 1.0)
-- Harm score (0.0 to 1.0)
-- Cost tier (from the COST_TIERS reference)
-- Net utility = Benefit - Harm - (Cost factor)
-
 ## Expected Value of Information (EVI)
-For each test:
-- Will this test change management?
-- What is the threshold probability for changing decision?
+For each test being CONSIDERED:
+- Will this test change management? (yes/no/maybe)
 - EVI score (0.0 to 1.0, where higher = more valuable)
+
+DO NOT include "threshold probability" - this will be calculated automatically.
+
+## Concrete Action Plan
+Provide specific, actionable next steps:
+1. Immediate actions (medications with doses, interventions)
+2. Disposition (admit vs discharge, which unit)
+3. Additional testing timeline
+4. Reassessment timing (when to follow-up)
+5. Escalation criteria (when to get CT, consult, etc.)
+
+Example:
+1. Start ceftriaxone 1g IV + azithromycin 500mg PO
+2. Admit to medical floor (CURB-65 = 2)
+3. Check procalcitonin now, repeat in 48h
+4. Reassess in 72 hours
+5. If no improvement or PCT rising → CT chest
 
 ## Recommendation
 [Final recommendation with confidence level, accounting for urgency]
@@ -1013,11 +1033,12 @@ At the end of your response, provide a JSON block with structured data:
   "major_complication_rate": <float 0-1>,
   "tests": [
     {{
-      "name": "<test name>",
+      "name": "<test name - ONLY tests being CONSIDERED, not already done>",
       "lr_positive": <float>,
       "lr_negative": <float>,
       "sensitivity": <float>,
-      "specificity": <float>
+      "specificity": <float>,
+      "cost_dollars": <actual cost in dollars, e.g., 50 for $50>
     }}
   ],
   "utilities": {{
@@ -1026,35 +1047,26 @@ At the end of your response, provide a JSON block with structured data:
     "observe_disease": <float 0-1>,
     "observe_healthy": <float 0-1>
   }},
-  "costs": [
-    {{
-      "item": "<test/intervention name>",
-      "tier": "<$ to $$$$$>",
-      "relative_cost": <number>,
-      "note": "<brief note>"
-    }}
-  ],
-  "evi_table": [
+  "evi_scores": [
     {{
       "test": "<test name>",
       "will_change_management": "<yes/no/maybe>",
-      "threshold_probability": <float 0-1>,
       "evi": <float 0-1>
     }}
   ],
-  "utility_rank": [
-    {{
-      "action": "<treat/test/observe>",
-      "benefit": <float 0-1>,
-      "harm": <float 0-1>,
-      "cost_tier": "<tier>",
-      "utility": <float>
-    }}
+  "action_plan": [
+    "<specific action 1>",
+    "<specific action 2>",
+    "<specific action 3>",
+    "<specific action 4>",
+    "<specific action 5>"
   ]
 }}
 ```
 
-Ensure all numeric values are actual numbers, not strings."""
+Ensure all numeric values are actual numbers, not strings.
+DO NOT include utility_rank or costs arrays - these are calculated automatically.
+DO NOT include threshold_probability in evi_scores - this is calculated automatically."""
 
 def process_with_llm(patient_query: str) -> Tuple[str, Dict]:
     """Process query with Gemini and extract structured data"""
@@ -1277,44 +1289,52 @@ def process_case(user_query: str):
                 # Display structured tables if JSON data available
                 if json_data:
                     # EVI Analysis
-                    if json_data.get("evi_table"):
+                    if json_data.get("evi_scores"):
                         with st.expander("📊 **Expected Value of Information (EVI) Analysis**", expanded=True):
                             st.markdown("*Which tests actually change management?*")
                             try:
                                 st.table({
-                                    "Test": [x.get("test","") for x in json_data["evi_table"]],
-                                    "Changes Management?": [x.get("will_change_management","") for x in json_data["evi_table"]],
-                                    "Threshold Probability": [f"{safe_float(x.get('threshold_probability', 0))*100:.1f}%" for x in json_data["evi_table"]],
-                                    "EVI Score": [f"{safe_float(x.get('evi', 0)):.3f}" for x in json_data["evi_table"]],
+                                    "Test": [x.get("test","") for x in json_data["evi_scores"]],
+                                    "Changes Management?": [x.get("will_change_management","") for x in json_data["evi_scores"]],
+                                    "EVI Score": [f"{safe_float(x.get('evi', 0)):.3f}" for x in json_data["evi_scores"]],
                                 })
                             except Exception as e:
                                 st.info("📊 EVI data available but formatting issue detected.")
                     
-                    # Cost Comparison
-                    if json_data.get("costs"):
-                        with st.expander("💰 **Relative Cost Comparison**", expanded=True):
-                            st.markdown("*Resource stewardship — what's the opportunity cost?*")
-                            st.table({
-                                "Test/Intervention": [x.get("item","") for x in json_data["costs"]],
-                                "Cost Tier": [x.get("tier","?") for x in json_data["costs"]],
-                                "× Baseline": [x.get("relative_cost","?") for x in json_data["costs"]],
-                                "Context": [x.get("note","") for x in json_data["costs"]],
-                            })
-                    
-                    # Utility Ranking
-                    if json_data.get("utility_rank"):
-                        with st.expander("⚖️ **Utility Ranking (Benefit − Harm − Cost)**", expanded=True):
-                            st.markdown("*Higher utility = better value for the patient*")
-                            try:
-                                st.table({
-                                    "Action": [x.get("action","") for x in json_data["utility_rank"]],
-                                    "Benefit": [f"{safe_float(x.get('benefit', 0)):.3f}" for x in json_data["utility_rank"]],
-                                    "Harm": [f"{safe_float(x.get('harm', 0)):.3f}" for x in json_data["utility_rank"]],
-                                    "Cost Tier": [x.get("cost_tier","?") for x in json_data["utility_rank"]],
-                                    "Net Utility": [f"{safe_float(x.get('utility', 0)):.3f}" for x in json_data["utility_rank"]],
+                    # Test Costs - Show actual dollars
+                    if json_data.get("tests"):
+                        with st.expander("💰 **Test Costs**", expanded=True):
+                            st.markdown("*Resource stewardship analysis*")
+                            test_data = []
+                            for test in json_data["tests"]:
+                                test_name = test.get("name", "")
+                                cost_dollars = test.get("cost_dollars", 0)
+                                
+                                # Get reference cost if not provided
+                                if cost_dollars == 0:
+                                    cost_info = get_cost_info(test_name)
+                                    if 'relative_cost' in cost_info and cost_info['relative_cost'] != 'unknown':
+                                        cost_dollars = cost_info['relative_cost'] * 50
+                                
+                                test_data.append({
+                                    "Test": test_name,
+                                    "Cost": f"${cost_dollars:,.0f}",
+                                    "Context": get_cost_info(test_name).get('note', '')
                                 })
-                            except Exception as e:
-                                st.info("⚖️ Utility ranking available but formatting issue detected.")
+                            
+                            if test_data:
+                                st.table({
+                                    "Test": [x["Test"] for x in test_data],
+                                    "Cost": [x["Cost"] for x in test_data],
+                                    "Context": [x["Context"] for x in test_data],
+                                })
+                    
+                    # Action Plan - NEW!
+                    if json_data.get("action_plan"):
+                        with st.expander("🎯 **Concrete Action Plan**", expanded=True):
+                            st.markdown("*Specific next steps for clinical implementation*")
+                            for i, action in enumerate(json_data["action_plan"], 1):
+                                st.markdown(f"**{i}.** {action}")
             
             # Create context from JSON data
             if json_data and json_data.get('prior_probability') is not None:
@@ -1352,9 +1372,17 @@ def create_context_from_json(json_data: Dict, patient_query: str) -> ClinicalDec
                 safe_float(test.get('lr_positive', 1.0)),
                 safe_float(test.get('lr_negative', 1.0))
             )
-            # Try to get cost from COST_TIERS
-            cost_info = get_cost_info(test_name)
-            test_costs[test_name] = safe_float(cost_info.get('relative_cost', 100))
+            
+            # Get cost from JSON or COST_TIERS
+            cost_dollars = safe_float(test.get('cost_dollars', 0))
+            if cost_dollars == 0:
+                cost_info = get_cost_info(test_name)
+                if 'relative_cost' in cost_info and cost_info['relative_cost'] != 'unknown':
+                    cost_dollars = cost_info['relative_cost'] * 50
+                else:
+                    cost_dollars = 100
+            
+            test_costs[test_name] = cost_dollars
     
     # Extract utilities
     utilities = json_data.get('utilities', {
@@ -1540,9 +1568,17 @@ def display_analysis_results():
                 else:
                     badge = "🔴 Poor value"
                 
+                # Smart formatting
+                if cost_per_qaly < 100:
+                    cost_display = f"${cost_per_qaly:.1f}/QALY"
+                elif cost_per_qaly < 10000:
+                    cost_display = f"${cost_per_qaly:,.0f}/QALY"
+                else:
+                    cost_display = f"${cost_per_qaly:,.0f}/QALY"
+                
                 st.markdown(f"""
                 **{test_name}** {badge}  
-                ${cost_per_qaly:,.0f}/QALY
+                {cost_display}
                 """)
     
     with tab2:
@@ -1581,8 +1617,17 @@ def display_analysis_results():
         with st.expander("🔢 QALY Economic Details"):
             st.markdown("**Cost-Effectiveness Thresholds:**  <$50k = Excellent, $50-100k = Good, >$100k = Poor")
             for test_name, evpi_data in results.evpi.items():
-                st.metric(f"{test_name} Cost/QALY", f"${evpi_data['cost_per_qaly']:,.0f}")
-                st.caption(f"EVPI: {evpi_data['evpi_qalys']:.4f} QALYs | {evpi_data['reason']}")
+                cost_per_qaly = evpi_data['cost_per_qaly']
+                # Smart formatting based on magnitude
+                if cost_per_qaly < 100:
+                    cost_display = f"${cost_per_qaly:.1f}"
+                elif cost_per_qaly < 10000:
+                    cost_display = f"${cost_per_qaly:,.0f}"
+                else:
+                    cost_display = f"${cost_per_qaly:,.0f}"
+                
+                st.metric(f"{test_name} Cost/QALY", cost_display)
+                st.caption(f"Test cost: ${evpi_data['test_cost']:.2f} | EVPI: {evpi_data['evpi_qalys']:.4f} QALYs | {evpi_data['reason']}")
         
         with st.expander("🔗 Influence Diagram"):
             st.markdown(results.influence_diagram['description'])

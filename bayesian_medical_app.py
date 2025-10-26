@@ -1589,9 +1589,18 @@ def display_analysis_results():
             fig = create_influence_diagram_viz(results.influence_diagram)
             st.plotly_chart(fig, use_container_width=True, key="influence_diagram_chart")
     
-    with tab2:
-        st.markdown("### Expected Value of Perfect Information (EVPI)")
-        st.markdown("Determines which tests are actually worth performing")
+    # ========================================================================
+    # END OF NEW MINIMALIST UI - Return here to skip old redundant code below
+    # ========================================================================
+    return
+    
+    # ========================================================================
+    # OLD UI CODE BELOW - NOT EXECUTED (kept for reference)
+    # ========================================================================
+    
+    # with tab2:
+    #     st.markdown("### Expected Value of Perfect Information (EVPI)")
+    #     st.markdown("Determines which tests are actually worth performing")
         
         for test_name, evpi_data in results.evpi.items():
             st.markdown(f"""

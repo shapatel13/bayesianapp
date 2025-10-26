@@ -253,6 +253,28 @@ class ClinicalDecisionContext:
     disease_name: str
     test_names: List[str]
     patient_query: str
+    # Clinical outcomes (more intuitive than QALYs)
+    mortality_untreated: float = 0.30  # Default 30%
+    mortality_treated: float = 0.08    # Default 8%
+    major_complication_rate: float = 0.02  # Default 2% (NNH)
+    # Time-critical urgency metrics (evidence-based)
+    has_shock: bool = False  # Critical distinction per literature
+    mortality_per_hour_delay: Optional[float] = None  # From published studies
+    urgency_category: str = "NON-URGENT"  # CRITICAL/URGENT/SEMI-URGENT/NON-URGENT
+    de_escalation_probability: float = 0.6  # Probability of narrowing therapy
+    de_escalation_timeline_hours: float = 48.0  # When to reassess
+    literature_source: Optional[str] = None  # Citation for time metrics
+    
+@dataclass
+class ClinicalOutcomes:
+    """Clinician-friendly outcome metrics"""
+    nnt_mortality: Optional[int]  # Number Needed to Treat to prevent 1 death
+    nnh_major_complication: Optional[int]  # Number Needed to Harm
+    arr_mortality: float  # Absolute Risk Reduction
+    rrr_mortality: float  # Relative Risk Reduction
+    lives_saved_per_100: float  # Expected lives saved per 100 treated
+    complications_per_100: float  # Expected complications per 100 treated
+    interpretation: str  # Plain language
     
 @dataclass
 class AdvancedAnalysisResults:
@@ -267,6 +289,7 @@ class AdvancedAnalysisResults:
     confidence: float
     llm_reasoning: str
     safety_warnings: List[str]
+    clinical_outcomes: Optional[ClinicalOutcomes] = None  # NEW: NNT/NNH metrics
 
 # ============================================================================
 # ADVANCED DECISION ENGINE
@@ -305,6 +328,9 @@ class AdvancedDecisionEngine:
         # Calculate confidence
         confidence = self._calculate_confidence(mcmc_results, sensitivity)
         
+        # Calculate clinical outcomes (NNT/NNH)
+        clinical_outcomes = self._calculate_clinical_outcomes(context)
+        
         return AdvancedAnalysisResults(
             thresholds=thresholds,
             evpi=evpi,
@@ -315,7 +341,68 @@ class AdvancedDecisionEngine:
             recommendation=recommendation,
             confidence=confidence,
             llm_reasoning="",  # Will be filled by LLM
-            safety_warnings=safety_warnings
+            safety_warnings=safety_warnings,
+            clinical_outcomes=clinical_outcomes
+        )
+    
+    def _calculate_clinical_outcomes(self, context: ClinicalDecisionContext) -> ClinicalOutcomes:
+        """
+        Calculate clinician-friendly outcome metrics (NNT/NNH)
+        More intuitive than QALYs for bedside decision-making
+        """
+        mortality_untreated = context.mortality_untreated
+        mortality_treated = context.mortality_treated
+        complication_rate = context.major_complication_rate
+        
+        # Absolute Risk Reduction (ARR)
+        arr = mortality_untreated - mortality_treated
+        
+        # Relative Risk Reduction (RRR)
+        rrr = arr / mortality_untreated if mortality_untreated > 0 else 0
+        
+        # Number Needed to Treat (NNT)
+        nnt = int(round(1 / arr)) if arr > 0 else None
+        
+        # Number Needed to Harm (NNH)
+        nnh = int(round(1 / complication_rate)) if complication_rate > 0 else None
+        
+        # Expected outcomes per 100 patients
+        lives_saved_per_100 = arr * 100
+        complications_per_100 = complication_rate * 100
+        
+        # Plain language interpretation
+        if nnt and nnh:
+            if nnt < 10:
+                benefit_level = "Very High"
+            elif nnt < 20:
+                benefit_level = "High"
+            elif nnt < 50:
+                benefit_level = "Moderate"
+            else:
+                benefit_level = "Low"
+            
+            # Risk-benefit ratio
+            if nnh > nnt * 10:
+                risk_level = "Low risk, excellent safety profile"
+            elif nnh > nnt * 5:
+                risk_level = "Acceptable risk-benefit ratio"
+            elif nnh > nnt * 2:
+                risk_level = "Moderate risk, consider carefully"
+            else:
+                risk_level = "High risk, use with caution"
+            
+            interpretation = f"{benefit_level} benefit (NNT={nnt}). {risk_level} (NNH={nnh})."
+        else:
+            interpretation = "Insufficient data for NNT/NNH calculation"
+        
+        return ClinicalOutcomes(
+            nnt_mortality=nnt,
+            nnh_major_complication=nnh,
+            arr_mortality=arr,
+            rrr_mortality=rrr,
+            lives_saved_per_100=lives_saved_per_100,
+            complications_per_100=complications_per_100,
+            interpretation=interpretation
         )
     
     def _compute_thresholds(self, context: ClinicalDecisionContext) -> Dict[str, float]:
@@ -863,6 +950,20 @@ Provide a comprehensive analysis with the following structure:
 ## Clinical Assessment
 [Your clinical reasoning and interpretation]
 
+## Time-Critical Urgency Assessment
+Evaluate urgency based on evidence:
+- Does the patient have SHOCK (septic, cardiogenic, hemorrhagic)? (Yes/No)
+- Urgency category:
+  * CRITICAL: Septic shock, STEMI, massive PE (treat immediately, < 1 hour)
+  * URGENT: Bacterial meningitis, DKA (1-6 hours)
+  * SEMI-URGENT: CAP without shock, appendicitis (6-24 hours)
+  * NON-URGENT: Stable conditions, no time pressure (> 24 hours)
+
+IMPORTANT - Evidence-based time considerations:
+- Septic SHOCK: 7% mortality increase per hour of antibiotic delay (NEJM 2017)
+- Sepsis WITHOUT shock: Delayed antibiotics may be acceptable for stewardship (Surgical ICU studies)
+- Shock is the KEY distinction for urgency
+
 ## Bayesian Analysis
 Estimate:
 - Prior probability of the disease/condition (0.0 to 1.0)
@@ -871,6 +972,13 @@ Estimate:
   - Sensitivity (LR+ calculation)
   - Specificity (LR- calculation)
   - Relative cost tier (use $ to $$$$$ scale)
+
+## Clinical Outcomes (NNT/NNH)
+For the primary treatment option:
+- Mortality if untreated (as decimal, e.g., 0.30 for 30%)
+- Mortality if treated (as decimal, e.g., 0.08 for 8%)
+- Major complication rate (as decimal, e.g., 0.02 for 2%)
+- Calculate and display NNT (Number Needed to Treat) and NNH (Number Needed to Harm)
 
 ## Utility Analysis
 For each decision option (treat, test, observe), estimate:
@@ -886,7 +994,7 @@ For each test:
 - EVI score (0.0 to 1.0, where higher = more valuable)
 
 ## Recommendation
-[Final recommendation with confidence level]
+[Final recommendation with confidence level, accounting for urgency]
 
 At the end of your response, provide a JSON block with structured data:
 
@@ -894,6 +1002,15 @@ At the end of your response, provide a JSON block with structured data:
 {{
   "prior_probability": <float between 0 and 1>,
   "disease_name": "<condition being evaluated>",
+  "has_shock": <true/false>,
+  "mortality_per_hour_delay": <float or null>,
+  "urgency_category": "<CRITICAL/URGENT/SEMI-URGENT/NON-URGENT>",
+  "de_escalation_probability": <float 0-1>,
+  "de_escalation_timeline_hours": <float>,
+  "literature_source": "<e.g., 'NEJM 2017' or null>",
+  "mortality_untreated": <float 0-1>,
+  "mortality_treated": <float 0-1>,
+  "major_complication_rate": <float 0-1>,
   "tests": [
     {{
       "name": "<test name>",
@@ -1247,6 +1364,22 @@ def create_context_from_json(json_data: Dict, patient_query: str) -> ClinicalDec
         'observe_healthy': 1.0
     })
     
+    # Extract mortality data for NNT/NNH calculations
+    mortality_untreated = safe_float(json_data.get('mortality_untreated', 0.30))
+    mortality_treated = safe_float(json_data.get('mortality_treated', 0.08))
+    major_complication_rate = safe_float(json_data.get('major_complication_rate', 0.02))
+    
+    # Extract urgency metrics
+    has_shock = json_data.get('has_shock', False)
+    mortality_per_hour_delay = json_data.get('mortality_per_hour_delay')
+    if mortality_per_hour_delay is not None:
+        mortality_per_hour_delay = safe_float(mortality_per_hour_delay)
+    
+    urgency_category = json_data.get('urgency_category', 'NON-URGENT')
+    de_escalation_probability = safe_float(json_data.get('de_escalation_probability', 0.6))
+    de_escalation_timeline_hours = safe_float(json_data.get('de_escalation_timeline_hours', 48.0))
+    literature_source = json_data.get('literature_source')
+    
     return ClinicalDecisionContext(
         prior_probability=safe_float(json_data.get('prior_probability', 0.5)),
         likelihood_ratios=likelihood_ratios,
@@ -1256,11 +1389,20 @@ def create_context_from_json(json_data: Dict, patient_query: str) -> ClinicalDec
         treatment_costs={},
         disease_name=json_data.get('disease_name', 'Unknown'),
         test_names=test_names,
-        patient_query=patient_query
+        patient_query=patient_query,
+        mortality_untreated=mortality_untreated,
+        mortality_treated=mortality_treated,
+        major_complication_rate=major_complication_rate,
+        has_shock=has_shock,
+        mortality_per_hour_delay=mortality_per_hour_delay,
+        urgency_category=urgency_category,
+        de_escalation_probability=de_escalation_probability,
+        de_escalation_timeline_hours=de_escalation_timeline_hours,
+        literature_source=literature_source
     )
 
 def display_analysis_results():
-    """Display advanced analysis results in tabs"""
+    """Display advanced analysis results in tabs with minimalist cool design"""
     if not st.session_state['results']:
         return
     
@@ -1268,53 +1410,184 @@ def display_analysis_results():
     context = st.session_state['context']
     
     st.markdown("---")
-    st.markdown("## 📊 Advanced Bayesian Analysis")
     
-    # Safety Warnings (if any)
-    if results.safety_warnings:
-        st.markdown("### 🛡️ Safety Alerts")
-        for warning in results.safety_warnings:
+    # === URGENCY ALERT (Top Priority - Minimalist Design) ===
+    if context.urgency_category in ["CRITICAL", "URGENT"]:
+        urgency_color = "#dc3545" if context.urgency_category == "CRITICAL" else "#ff9800"
+        urgency_icon = "🚨" if context.urgency_category == "CRITICAL" else "⚠️"
+        
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, {urgency_color}15 0%, {urgency_color}05 100%); 
+                    border-left: 4px solid {urgency_color}; 
+                    border-radius: 8px; padding: 20px; margin-bottom: 24px;">
+            <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
+                <span style="font-size: 32px;">{urgency_icon}</span>
+                <span style="font-size: 24px; font-weight: 600; color: {urgency_color};">
+                    {context.urgency_category} TIME PRESSURE
+                </span>
+            </div>
+            <div style="font-size: 16px; line-height: 1.6;">
+                {f'<strong>Mortality increases {context.mortality_per_hour_delay*100:.0f}% per hour of delay</strong>' if context.mortality_per_hour_delay else ''}
+                {f'<div style="opacity: 0.8; margin-top: 8px;">Source: {context.literature_source}</div>' if context.literature_source else ''}
+                {'<div style="margin-top: 12px; padding: 12px; background: white; border-radius: 4px;"><strong>⚡ KEY DISTINCTION:</strong> Shock present → Immediate antibiotics. No shock → Diagnostic stewardship acceptable.</div>' if 'sepsis' in context.disease_name.lower() or 'shock' in context.disease_name.lower() else ''}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # === CLINICAL OUTCOMES (Primary Display - Clean & Minimalist) ===
+    if results.clinical_outcomes and results.clinical_outcomes.nnt_mortality:
+        st.markdown("### 🎯 Clinical Impact")
+        
+        # Compact metric cards
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
             st.markdown(f"""
-            <div class="safety-alert">
-                {warning}
+            <div style="background: white; border-radius: 8px; padding: 16px; border: 2px solid #e3f2fd;">
+                <div style="font-size: 14px; color: #666; margin-bottom: 4px;">To Save 1 Life</div>
+                <div style="font-size: 32px; font-weight: 700; color: #1976d2;">
+                    {results.clinical_outcomes.nnt_mortality}
+                </div>
+                <div style="font-size: 12px; color: #999;">patients treated (NNT)</div>
             </div>
             """, unsafe_allow_html=True)
+        
+        with col2:
+            nnh_color = "#4caf50" if results.clinical_outcomes.nnh_major_complication and results.clinical_outcomes.nnh_major_complication > results.clinical_outcomes.nnt_mortality * 5 else "#ff9800"
+            st.markdown(f"""
+            <div style="background: white; border-radius: 8px; padding: 16px; border: 2px solid {nnh_color}15;">
+                <div style="font-size: 14px; color: #666; margin-bottom: 4px;">Harm Risk</div>
+                <div style="font-size: 32px; font-weight: 700; color: {nnh_color};">
+                    1:{results.clinical_outcomes.nnh_major_complication if results.clinical_outcomes.nnh_major_complication else 'N/A'}
+                </div>
+                <div style="font-size: 12px; color: #999;">complication rate (NNH)</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col3:
+            st.markdown(f"""
+            <div style="background: white; border-radius: 8px; padding: 16px; border: 2px solid #f3e5f5;">
+                <div style="font-size: 14px; color: #666; margin-bottom: 4px;">Absolute Benefit</div>
+                <div style="font-size: 32px; font-weight: 700; color: #9c27b0;">
+                    {results.clinical_outcomes.arr_mortality*100:.0f}%
+                </div>
+                <div style="font-size: 12px; color: #999;">risk reduction</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # Simple interpretation
+        st.info(f"💡 {results.clinical_outcomes.interpretation}")
+        
+        # De-escalation plan (if applicable)
+        if context.urgency_category == "CRITICAL" and context.de_escalation_probability > 0.5:
+            st.markdown(f"""
+            <div style="background: #f5f5f5; border-radius: 8px; padding: 16px; margin-top: 16px;">
+                <strong>🎯 De-Escalation Strategy</strong>
+                <div style="margin-top: 8px;">
+                    • Reassess in {context.de_escalation_timeline_hours:.0f} hours<br>
+                    • {context.de_escalation_probability*100:.0f}% probability of narrowing therapy<br>
+                    • Planned strategy, not failure
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        st.markdown("---")
     
-    # Quick metrics
+    # === SAFETY WARNINGS ===
+    if results.safety_warnings:
+        for warning in results.safety_warnings:
+            st.error(f"⚠️ {warning}")
+        st.markdown("---")
+    
+    # === DECISION SUMMARY (Minimal) ===
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("Recommendation", results.recommendation)
+        st.metric("Decision", results.recommendation, help="Primary recommendation")
     with col2:
-        st.metric("Prior Probability", f"{context.prior_probability:.1%}")
+        st.metric("Pre-test Probability", f"{context.prior_probability:.0%}", help="Prior probability")
     with col3:
-        st.metric("Confidence", f"{results.confidence:.0%}")
+        st.metric("Confidence", f"{results.confidence:.0%}", help="Model confidence")
     with col4:
-        st.metric("Treat Threshold", f"{results.thresholds['treat_threshold']:.1%}")
+        st.metric("Treat Threshold", f"{results.thresholds['treat_threshold']:.0%}", help="Treatment threshold probability")
     
-    # Tabs for detailed analysis
+    # === DETAILED ANALYSIS (Tabbed - Cleaner Organization) ===
     st.markdown("---")
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🎯 Thresholds", 
-        "💰 Value of Information", 
+    st.markdown("### 📊 Detailed Analysis")
+    
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🎯 Thresholds & Tests", 
         "🎲 Uncertainty", 
-        "📊 Sensitivity",
-        "🧠 Cognitive Biases"
+        "🧠 Biases",
+        "🔢 Advanced Metrics"
     ])
     
     with tab1:
-        st.markdown("### Decision Threshold Analysis")
-        st.markdown("Shows the probability ranges where each action is optimal")
+        col_a, col_b = st.columns(2)
         
-        fig = create_threshold_viz(context, results.thresholds)
+        with col_a:
+            st.markdown("**Decision Thresholds**")
+            fig = create_threshold_viz(context, results.thresholds)
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with col_b:
+            st.markdown("**Test Value (EVPI)**")
+            for test_name, evpi_data in results.evpi.items():
+                cost_per_qaly = evpi_data['cost_per_qaly']
+                if cost_per_qaly < 50000:
+                    badge = "🟢 Excellent"
+                elif cost_per_qaly < 100000:
+                    badge = "🟡 Consider"
+                else:
+                    badge = "🔴 Poor value"
+                
+                st.markdown(f"""
+                **{test_name}** {badge}  
+                ${cost_per_qaly:,.0f}/QALY
+                """)
+    
+    with tab2:
+        st.markdown("**Monte Carlo Simulation** (10,000 runs)")
+        fig = create_mcmc_distribution(results.mcmc_results)
         st.plotly_chart(fig, use_container_width=True)
         
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
         with col1:
-            st.metric("Observe Zone", f"< {results.thresholds['test_threshold']:.1%}")
+            st.metric("Mean", f"{results.mcmc_results['mean']:.1%}")
+            st.metric("95% CI Lower", f"{results.mcmc_results['ci_95_lower']:.1%}")
         with col2:
-            st.metric("Test Zone", f"{results.thresholds['test_threshold']:.1%} - {results.thresholds['treat_threshold']:.1%}")
-        with col3:
-            st.metric("Treat Zone", f"> {results.thresholds['treat_threshold']:.1%}")
+            if results.mcmc_results['uncertainty_high']:
+                st.warning("⚠️ High uncertainty - consider more data")
+            else:
+                st.success("✓ Acceptable uncertainty")
+            st.metric("95% CI Upper", f"{results.mcmc_results['ci_95_upper']:.1%}")
+    
+    with tab3:
+        if results.bias_warnings:
+            for warning in results.bias_warnings:
+                st.warning(f"""
+                **{warning['icon']} {warning['bias']}**  
+                {warning['description']}  
+                💡 *{warning['suggestion']}*
+                """)
+        else:
+            st.success("✓ No cognitive biases detected")
+    
+    with tab4:
+        # QALY details, sensitivity analysis
+        st.markdown("**Sensitivity Analysis**")
+        fig = create_sensitivity_tornado(results.sensitivity)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        with st.expander("🔢 QALY Economic Details"):
+            st.markdown("**Cost-Effectiveness Thresholds:**  <$50k = Excellent, $50-100k = Good, >$100k = Poor")
+            for test_name, evpi_data in results.evpi.items():
+                st.metric(f"{test_name} Cost/QALY", f"${evpi_data['cost_per_qaly']:,.0f}")
+                st.caption(f"EVPI: {evpi_data['evpi_qalys']:.4f} QALYs | {evpi_data['reason']}")
+        
+        with st.expander("🔗 Influence Diagram"):
+            st.markdown(results.influence_diagram['description'])
+            fig = create_influence_diagram_viz(results.influence_diagram)
+            st.plotly_chart(fig, use_container_width=True)
     
     with tab2:
         st.markdown("### Expected Value of Perfect Information (EVPI)")
@@ -1384,6 +1657,79 @@ def display_analysis_results():
                 """, unsafe_allow_html=True)
         else:
             st.success("✓ No cognitive biases detected")
+    
+    with tab6:
+        st.markdown("### QALY (Quality-Adjusted Life Year) Details")
+        st.markdown("*Advanced economic analysis for resource stewardship*")
+        
+        # EVPI with QALY details
+        st.markdown("#### Expected Value of Perfect Information")
+        for test_name, evpi_data in results.evpi.items():
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.markdown(f"""
+                <div class="metric-box">
+                    <h4 style="margin-top: 0;">{test_name} {evpi_data['recommendation']}</h4>
+                    <p><strong>Cost per QALY:</strong> ${evpi_data['cost_per_qaly']:,.0f}</p>
+                    <p><strong>Test Cost:</strong> ${evpi_data['test_cost']:,.0f}</p>
+                    <p><strong>EVPI:</strong> {evpi_data['evpi_qalys']:.4f} QALYs</p>
+                    <p style="color: #666;">{evpi_data['reason']}</p>
+                </div>
+                """, unsafe_allow_html=True)
+            with col2:
+                # Color-coded value indicator
+                cost_per_qaly = evpi_data['cost_per_qaly']
+                if cost_per_qaly < 50000:
+                    st.success("✅ Excellent Value")
+                elif cost_per_qaly < 100000:
+                    st.warning("⚠️ Good Value")
+                else:
+                    st.error("❌ Poor Value")
+        
+        st.info("💡 **Cost-effectiveness thresholds:** <$50k/QALY = Excellent, $50-100k = Good, >$100k = Poor")
+        
+        # Utility weights explanation
+        st.markdown("---")
+        st.markdown("#### Utility Weights Used")
+        st.markdown("*These values represent quality of life on a 0-1 scale*")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Treat Success (Disease Present)", f"{context.utilities.get('treat_success', 0):.2f}")
+            st.caption("Quality of life after successful treatment")
+            
+            st.metric("Observe Disease (Untreated)", f"{context.utilities.get('observe_disease', 0):.2f}")
+            st.caption("Quality of life if disease progresses untreated")
+        
+        with col2:
+            st.metric("Treat Healthy (False Positive)", f"{context.utilities.get('treat_healthy', 0):.2f}")
+            st.caption("Quality of life after unnecessary treatment")
+            
+            st.metric("Observe Healthy (True Negative)", f"{context.utilities.get('observe_healthy', 1):.2f}")
+            st.caption("Perfect health baseline")
+        
+        # QALY calculation explanation
+        with st.expander("📚 How QALYs Are Calculated"):
+            st.markdown("""
+            **QALY = Years of Life × Quality Weight**
+            
+            Quality weights range from 0 (death) to 1 (perfect health):
+            - 1.0 = Perfect health
+            - 0.9 = Mild symptoms
+            - 0.7 = Moderate disability
+            - 0.5 = Severe disability  
+            - 0.0 = Death
+            
+            **Example:**
+            - Treatment extends life 10 years at 0.85 quality = **8.5 QALYs**
+            - Better than 5 years at 0.95 quality = **4.75 QALYs**
+            
+            **Cost-Effectiveness:**
+            - Treatment costs $50,000 and gains 1 QALY → $50,000/QALY ✓
+            - Treatment costs $200,000 and gains 1 QALY → $200,000/QALY ✗
+            
+            **Standard Threshold:** $50,000-$150,000 per QALY (US)
+            """)
     
     # Influence Diagram (collapsed by default)
     with st.expander("🔗 View Influence Diagram", expanded=False):

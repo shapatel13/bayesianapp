@@ -1527,7 +1527,7 @@ def display_analysis_results():
         with col_a:
             st.markdown("**Decision Thresholds**")
             fig = create_threshold_viz(context, results.thresholds)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="threshold_chart")
         
         with col_b:
             st.markdown("**Test Value (EVPI)**")
@@ -1548,7 +1548,7 @@ def display_analysis_results():
     with tab2:
         st.markdown("**Monte Carlo Simulation** (10,000 runs)")
         fig = create_mcmc_distribution(results.mcmc_results)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="mcmc_chart_tab2")
         
         col1, col2 = st.columns(2)
         with col1:
@@ -1576,7 +1576,7 @@ def display_analysis_results():
         # QALY details, sensitivity analysis
         st.markdown("**Sensitivity Analysis**")
         fig = create_sensitivity_tornado(results.sensitivity)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="sensitivity_chart_tab4")
         
         with st.expander("🔢 QALY Economic Details"):
             st.markdown("**Cost-Effectiveness Thresholds:**  <$50k = Excellent, $50-100k = Good, >$100k = Poor")
@@ -1587,7 +1587,7 @@ def display_analysis_results():
         with st.expander("🔗 Influence Diagram"):
             st.markdown(results.influence_diagram['description'])
             fig = create_influence_diagram_viz(results.influence_diagram)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="influence_diagram_chart")
     
     with tab2:
         st.markdown("### Expected Value of Perfect Information (EVPI)")
@@ -1611,7 +1611,7 @@ def display_analysis_results():
         st.markdown("Based on 10,000 Monte Carlo simulations")
         
         fig = create_mcmc_distribution(results.mcmc_results)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="mcmc_chart_tab3")
         
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -1631,7 +1631,7 @@ def display_analysis_results():
         st.markdown("Shows which parameters most affect the decision")
         
         fig = create_sensitivity_tornado(results.sensitivity)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="sensitivity_chart_old_tab4")
         
         if results.sensitivity['decision_fragile']:
             st.warning(f"⚠️ **Decision is fragile** - Most sensitive to: {results.sensitivity['most_influential']}")
@@ -1738,7 +1738,7 @@ def display_analysis_results():
         
         # Interactive visualization
         fig = create_influence_diagram_viz(results.influence_diagram)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="influence_diagram_old_tab6")
         
         # Detailed node information
         st.markdown("---")

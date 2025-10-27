@@ -42,7 +42,7 @@ COST_TIERS = {
     
     # AKI workup
     "Renal ultrasound (bedside)": {"tier": "$", "relative_cost": 2, "note": "POCUS, low-cost"},
-    "Furosemide stress test": {"tier": "$", "relative_cost": 0.2, "note": "Drug + monitoring"},
+    "Furosemide stress test (FST)": {"tier": "$", "relative_cost": 0.2, "note": "Predicts AKI progression; 1mg/kg IV furosemide + UOP monitoring"},
     "CRRT (per day)": {"tier": "$$$$$", "relative_cost": 100, "note": "Very high ongoing cost"},
     "Daily CMP": {"tier": "$", "relative_cost": 1, "note": "Standard monitoring"},
     
@@ -952,13 +952,25 @@ def create_llm_prompt(patient_query: str) -> str:
     """Create enhanced prompt for Gemini with structured output"""
     return f"""You are an expert clinical decision support system using Bayesian reasoning, Expected Value of Information (EVI), and utility theory.
 
+IMPORTANT - Common Medical Abbreviations:
+- FST = Furosemide Stress Test (NOT "fluid stress test") - used to predict AKI progression
+- CRRT = Continuous Renal Replacement Therapy (dialysis)
+- VExUS = Venous Excess Ultrasound Score (congestion assessment)
+- RRT = Renal Replacement Therapy
+
 Analyze this clinical case:
 {patient_query}
 
 Provide a comprehensive analysis with the following structure:
 
 ## Clinical Assessment
-[Your clinical reasoning and interpretation]
+[Your clinical reasoning - keep this CONCISE using bullet points, not long paragraphs]
+
+Format your assessment as:
+• Key finding 1
+• Key finding 2
+• Key finding 3
+• Bottom line: [one sentence conclusion]
 
 ## Differential Diagnosis (CRITICAL - Do This First!)
 
@@ -1045,10 +1057,26 @@ Example:
 ## Recommendation
 [Final recommendation with confidence level, accounting for urgency and differential diagnosis]
 
+## TL;DR Section (CRITICAL - For Busy Clinicians)
+Provide a concise, scannable summary that answers:
+- What is most likely? (primary diagnosis with probability)
+- What should I do? (single most important action)
+- How urgent? (NOW / 1-6 hours / 6-24 hours / routine)
+- Bottom line? (one sentence takeaway)
+
+This appears FIRST in the output, so make it count!
+
 At the end of your response, provide a JSON block with structured data:
 
 ```json
 {{
+  "tldr": {{
+    "primary_diagnosis": "<most likely diagnosis>",
+    "probability": <float 0-1>,
+    "key_action": "<single most important action>",
+    "time_sensitive": "<NOW / 1-6 hours / 6-24 hours / routine>",
+    "bottom_line": "<one sentence takeaway>"
+  }},
   "differential_diagnosis": [
     {{
       "diagnosis": "<name of diagnosis>",
@@ -1227,10 +1255,10 @@ def main():
             st.session_state["messages"].append({"role":"user","content":user_q})
             st.rerun()
         
-        if st.button("📍 AKI Oliguria — FST vs Early RRT", use_container_width=True):
+        if st.button("📍 AKI Oliguria — Furosemide Stress Test vs Early RRT", use_container_width=True):
             user_q = (
                 "ICU patient oliguric post-sepsis; Cr 2.7 (baseline 1.0), K 5.3, HCO3 18. "
-                "POCUS: VExUS 2, no hydronephrosis; bladder 80 mL. Should I do FST, and when to start CRRT?"
+                "POCUS: VExUS 2, no hydronephrosis; bladder 80 mL. Should I do a furosemide stress test (FST) to predict progression, and when to start CRRT?"
             )
             st.session_state["messages"].append({"role":"user","content":user_q})
             st.rerun()
@@ -1329,13 +1357,64 @@ def process_case(user_query: str):
             
             # Display LLM response
             with st.chat_message("assistant"):
+                # TL;DR - Bottom Line Up Front (NEW!)
+                if json_data and json_data.get("tldr"):
+                    tldr = json_data["tldr"]
+                    prob = tldr.get("probability", 0)
+                    
+                    # Determine urgency color
+                    time_sensitive = tldr.get("time_sensitive", "routine").upper()
+                    if "NOW" in time_sensitive or "CRITICAL" in time_sensitive:
+                        urgency_color = "#dc3545"
+                        urgency_icon = "🚨"
+                    elif "1-6" in time_sensitive or "URGENT" in time_sensitive:
+                        urgency_color = "#ff9800"
+                        urgency_icon = "⚠️"
+                    else:
+                        urgency_color = "#4caf50"
+                        urgency_icon = "✅"
+                    
+                    st.markdown(f"""
+                    <div style="background: linear-gradient(135deg, #f5f5f5 0%, #e8e8e8 100%); 
+                                border-radius: 12px; 
+                                padding: 24px; 
+                                margin-bottom: 24px;
+                                border-left: 6px solid {urgency_color};">
+                        <div style="font-size: 14px; font-weight: 600; color: #666; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px;">
+                            📋 Bottom Line Up Front
+                        </div>
+                        <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 20px; margin-bottom: 16px;">
+                            <div>
+                                <div style="font-size: 20px; font-weight: 700; color: #1976d2; margin-bottom: 8px;">
+                                    {tldr.get('primary_diagnosis', 'N/A')} ({prob*100:.0f}%)
+                                </div>
+                                <div style="font-size: 16px; color: #555; line-height: 1.6;">
+                                    {tldr.get('bottom_line', '')}
+                                </div>
+                            </div>
+                            <div style="background: white; border-radius: 8px; padding: 16px; text-align: center;">
+                                <div style="font-size: 36px; margin-bottom: 8px;">{urgency_icon}</div>
+                                <div style="font-size: 14px; font-weight: 600; color: {urgency_color};">
+                                    {time_sensitive}
+                                </div>
+                            </div>
+                        </div>
+                        <div style="background: white; border-radius: 8px; padding: 16px;">
+                            <div style="font-size: 14px; color: #666; margin-bottom: 4px;">🎯 Key Action:</div>
+                            <div style="font-size: 16px; font-weight: 600; color: #333;">
+                                {tldr.get('key_action', 'N/A')}
+                            </div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
                 st.markdown(llm_response)
                 
                 # Display structured tables if JSON data available
                 if json_data:
-                    # Differential Diagnosis - NEW! (Show first, most important)
+                    # Differential Diagnosis - Show second, collapsed by default now
                     if json_data.get("differential_diagnosis"):
-                        with st.expander("🔍 **Differential Diagnosis**", expanded=True):
+                        with st.expander("🔍 **Differential Diagnosis**", expanded=False):
                             st.markdown("*Competing explanations for patient's symptoms*")
                             
                             # Sort by probability (highest first)
@@ -1418,9 +1497,9 @@ def process_case(user_query: str):
                             if json_data.get("competing_diagnosis_note"):
                                 st.info(f"💡 **Key Insight:** {json_data['competing_diagnosis_note']}")
                     
-                    # EVI Analysis
+                    # EVI Analysis - Collapsed by default
                     if json_data.get("evi_scores"):
-                        with st.expander("📊 **Expected Value of Information (EVI) Analysis**", expanded=True):
+                        with st.expander("📊 **Expected Value of Information (EVI) Analysis**", expanded=False):
                             st.markdown("*Which tests actually change management?*")
                             try:
                                 # Create enhanced table with differentiation info
@@ -1434,9 +1513,9 @@ def process_case(user_query: str):
                             except Exception as e:
                                 st.info("📊 EVI data available but formatting issue detected.")
                     
-                    # Test Costs - Show actual dollars and what they differentiate
+                    # Test Costs - Show actual dollars and what they differentiate - Collapsed
                     if json_data.get("tests"):
-                        with st.expander("💰 **Test Costs & Purpose**", expanded=True):
+                        with st.expander("💰 **Test Costs & Purpose**", expanded=False):
                             st.markdown("*Resource stewardship and diagnostic strategy*")
                             test_data = []
                             for test in json_data["tests"]:
@@ -1463,12 +1542,20 @@ def process_case(user_query: str):
                                     "Cost": [x["Cost"] for x in test_data],
                                 })
                     
-                    # Action Plan - NEW!
+                    # Action Plan - Show top 3, rest collapsed
                     if json_data.get("action_plan"):
-                        with st.expander("🎯 **Concrete Action Plan**", expanded=True):
-                            st.markdown("*Specific next steps for clinical implementation*")
-                            for i, action in enumerate(json_data["action_plan"], 1):
-                                st.markdown(f"**{i}.** {action}")
+                        actions = json_data["action_plan"]
+                        
+                        # Show top 3 prominently
+                        st.markdown("### 🎯 Next Steps")
+                        for i, action in enumerate(actions[:3], 1):
+                            st.markdown(f"**{i}.** {action}")
+                        
+                        # Show rest in expander if more than 3
+                        if len(actions) > 3:
+                            with st.expander("**See all steps** ▼", expanded=False):
+                                for i, action in enumerate(actions[3:], 4):
+                                    st.markdown(f"**{i}.** {action}")
             
             # Create context from JSON data
             if json_data and json_data.get('prior_probability') is not None:
@@ -1672,14 +1759,16 @@ def display_analysis_results():
     with col4:
         st.metric("Treat Threshold", f"{results.thresholds['treat_threshold']:.0%}", help="Treatment threshold probability")
     
-    # === DETAILED ANALYSIS (Tabbed - Cleaner Organization) ===
+    # === DETAILED ANALYSIS (Tabbed - Collapsed by default for cognitive ease) ===
     st.markdown("---")
-    st.markdown("### 📊 Detailed Analysis")
     
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "🎯 Thresholds & Tests", 
-        "🎲 Uncertainty", 
-        "🧠 Biases",
+    with st.expander("📊 **Advanced Bayesian Analysis** (for deep dive)", expanded=False):
+        st.markdown("*Detailed probability calculations, uncertainty analysis, and advanced metrics*")
+        
+        tab1, tab2, tab3, tab4 = st.tabs([
+            "🎯 Thresholds & Tests", 
+            "🎲 Uncertainty", 
+            "🧠 Biases",
         "🔢 Advanced Metrics"
     ])
     
@@ -1762,11 +1851,6 @@ def display_analysis_results():
                 
                 st.metric(f"{test_name} Cost/QALY", cost_display)
                 st.caption(f"Test cost: ${evpi_data['test_cost']:.2f} | EVPI: {evpi_data['evpi_qalys']:.4f} QALYs | {evpi_data['reason']}")
-        
-        with st.expander("🔗 Influence Diagram"):
-            st.markdown(results.influence_diagram['description'])
-            fig = create_influence_diagram_viz(results.influence_diagram)
-            st.plotly_chart(fig, use_container_width=True, key="influence_diagram_chart")
     
     # ========================================================================
     # END OF NEW MINIMALIST UI - Return here to skip old redundant code below

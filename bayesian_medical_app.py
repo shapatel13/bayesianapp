@@ -960,6 +960,30 @@ Provide a comprehensive analysis with the following structure:
 ## Clinical Assessment
 [Your clinical reasoning and interpretation]
 
+## Differential Diagnosis (CRITICAL - Do This First!)
+
+Before focusing on any single diagnosis, consider ALL competing explanations for the patient's presentation.
+
+**Key Principle: "Explaining Away"**
+- If one diagnosis strongly explains the symptoms, others become less likely
+- Example: CXR shows clear pneumonia → P(PE as cause of hypoxia) drops significantly
+- But concurrent diagnoses ARE possible (PE + CAP can coexist)
+
+For EACH plausible diagnosis in your differential:
+1. Estimate probability (0.0 to 1.0)
+2. Rate how well it explains EACH key symptom (poor/fair/good/excellent)
+3. List evidence FOR this diagnosis
+4. List evidence AGAINST this diagnosis
+5. Explain impact on other diagnoses
+
+Example reasoning:
+"Patient has hypoxia. Could be PE (prior 40% given recent surgery). BUT CXR shows infiltrate 
+suggesting CAP (prior 15%). Since CAP explains BOTH hypoxia AND fever excellently, while PE 
+explains hypoxia well but fever poorly, CAP is more likely (65%) and PE probability drops to 15%. 
+However, PE + CAP concurrent remains possible (~5%)."
+
+Identify your PRIMARY diagnosis (most likely) and explain your reasoning.
+
 ## Time-Critical Urgency Assessment
 Evaluate urgency based on evidence:
 - Does the patient have SHOCK (septic, cardiogenic, hemorrhagic)? (Yes/No)
@@ -978,14 +1002,18 @@ IMPORTANT - Evidence-based time considerations:
 IMPORTANT: Only list tests that are being CONSIDERED (not already done).
 If a test has already been performed (e.g., CXR already positive), do NOT include it in this table.
 
+Focus on tests that DIFFERENTIATE between your top differential diagnoses.
+
 For each test being considered:
 - Test name
+- What diagnoses does it differentiate? (e.g., "PE vs CAP")
+- How will results change management?
 - Sensitivity (for LR+ calculation)
 - Specificity (for LR- calculation)
 - Estimated cost in dollars (e.g., $50, $100, $1750)
 
 ## Clinical Outcomes (NNT/NNH)
-For the primary treatment option:
+For the PRIMARY treatment option (treating your most likely diagnosis):
 - Mortality if untreated (as decimal, e.g., 0.30 for 30%)
 - Mortality if treated (as decimal, e.g., 0.08 for 8%)
 - Major complication rate (as decimal, e.g., 0.02 for 2%)
@@ -994,6 +1022,7 @@ For the primary treatment option:
 ## Expected Value of Information (EVI)
 For each test being CONSIDERED:
 - Will this test change management? (yes/no/maybe)
+- What does it differentiate?
 - EVI score (0.0 to 1.0, where higher = more valuable)
 
 DO NOT include "threshold probability" - this will be calculated automatically.
@@ -1002,26 +1031,40 @@ DO NOT include "threshold probability" - this will be calculated automatically.
 Provide specific, actionable next steps:
 1. Immediate actions (medications with doses, interventions)
 2. Disposition (admit vs discharge, which unit)
-3. Additional testing timeline
+3. Additional testing timeline and rationale
 4. Reassessment timing (when to follow-up)
-5. Escalation criteria (when to get CT, consult, etc.)
+5. Escalation criteria (when to get more tests, consult, etc.)
 
 Example:
-1. Start ceftriaxone 1g IV + azithromycin 500mg PO
+1. Start ceftriaxone 1g IV + azithromycin 500mg PO (treat CAP)
 2. Admit to medical floor (CURB-65 = 2)
-3. Check procalcitonin now, repeat in 48h
-4. Reassess in 72 hours
-5. If no improvement or PCT rising → CT chest
+3. Check procalcitonin now (bacterial vs viral), D-dimer (r/o concurrent PE)
+4. Reassess in 48-72 hours
+5. If no improvement or D-dimer elevated → CTA chest for PE
 
 ## Recommendation
-[Final recommendation with confidence level, accounting for urgency]
+[Final recommendation with confidence level, accounting for urgency and differential diagnosis]
 
 At the end of your response, provide a JSON block with structured data:
 
 ```json
 {{
-  "prior_probability": <float between 0 and 1>,
-  "disease_name": "<condition being evaluated>",
+  "differential_diagnosis": [
+    {{
+      "diagnosis": "<name of diagnosis>",
+      "probability": <float 0-1>,
+      "symptom_explanation": {{
+        "<symptom1>": "<poor/fair/good/excellent>",
+        "<symptom2>": "<poor/fair/good/excellent>"
+      }},
+      "evidence_for": ["<evidence 1>", "<evidence 2>"],
+      "evidence_against": ["<evidence 1>", "<evidence 2>"],
+      "is_primary": <true/false>
+    }}
+  ],
+  "competing_diagnosis_note": "<explanation of how finding one diagnosis affects others>",
+  "prior_probability": <float between 0 and 1 for PRIMARY diagnosis>,
+  "disease_name": "<PRIMARY diagnosis being evaluated>",
   "has_shock": <true/false>,
   "mortality_per_hour_delay": <float or null>,
   "urgency_category": "<CRITICAL/URGENT/SEMI-URGENT/NON-URGENT>",
@@ -1034,6 +1077,7 @@ At the end of your response, provide a JSON block with structured data:
   "tests": [
     {{
       "name": "<test name - ONLY tests being CONSIDERED, not already done>",
+      "differentiates": "<which diagnoses does this help distinguish>",
       "lr_positive": <float>,
       "lr_negative": <float>,
       "sensitivity": <float>,
@@ -1050,6 +1094,7 @@ At the end of your response, provide a JSON block with structured data:
   "evi_scores": [
     {{
       "test": "<test name>",
+      "differentiates": "<PE vs CAP, etc>",
       "will_change_management": "<yes/no/maybe>",
       "evi": <float 0-1>
     }}
@@ -1288,27 +1333,116 @@ def process_case(user_query: str):
                 
                 # Display structured tables if JSON data available
                 if json_data:
+                    # Differential Diagnosis - NEW! (Show first, most important)
+                    if json_data.get("differential_diagnosis"):
+                        with st.expander("🔍 **Differential Diagnosis**", expanded=True):
+                            st.markdown("*Competing explanations for patient's symptoms*")
+                            
+                            # Sort by probability (highest first)
+                            diff_dx = sorted(
+                                json_data["differential_diagnosis"], 
+                                key=lambda x: x.get("probability", 0), 
+                                reverse=True
+                            )
+                            
+                            for i, dx in enumerate(diff_dx):
+                                prob = dx.get("probability", 0)
+                                is_primary = dx.get("is_primary", i == 0)
+                                
+                                # Color code by probability
+                                if prob > 0.50:
+                                    color = "🟢"
+                                    label = "Most Likely"
+                                elif prob > 0.20:
+                                    color = "🟡"
+                                    label = "Possible"
+                                elif prob > 0.05:
+                                    color = "🟠"
+                                    label = "Consider"
+                                else:
+                                    color = "⚪"
+                                    label = "Less Likely"
+                                
+                                # Primary diagnosis gets special styling
+                                if is_primary:
+                                    st.markdown(f"""
+                                    <div style="background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%); 
+                                                border-left: 4px solid #1976d2; 
+                                                border-radius: 8px; 
+                                                padding: 16px; 
+                                                margin-bottom: 16px;">
+                                        <div style="font-size: 18px; font-weight: 600; color: #1976d2; margin-bottom: 8px;">
+                                            {color} {dx['diagnosis']} - {prob*100:.0f}% ({label}) ⭐ PRIMARY
+                                        </div>
+                                    """, unsafe_allow_html=True)
+                                else:
+                                    st.markdown(f"### {color} {dx['diagnosis']} - {prob*100:.0f}% ({label})")
+                                
+                                # Symptom explanation
+                                if dx.get("symptom_explanation"):
+                                    st.markdown("**How well it explains symptoms:**")
+                                    symptom_text = []
+                                    for symptom, rating in dx["symptom_explanation"].items():
+                                        # Emoji for rating
+                                        if rating.lower() == "excellent":
+                                            emoji = "🟢"
+                                        elif rating.lower() == "good":
+                                            emoji = "🟡"
+                                        elif rating.lower() == "fair":
+                                            emoji = "🟠"
+                                        else:
+                                            emoji = "⚪"
+                                        symptom_text.append(f"{emoji} {symptom}: *{rating}*")
+                                    st.markdown(" · ".join(symptom_text))
+                                
+                                # Evidence
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    if dx.get("evidence_for"):
+                                        st.markdown("**✅ Evidence FOR:**")
+                                        for evidence in dx["evidence_for"]:
+                                            st.markdown(f"• {evidence}")
+                                
+                                with col2:
+                                    if dx.get("evidence_against"):
+                                        st.markdown("**❌ Evidence AGAINST:**")
+                                        for evidence in dx["evidence_against"]:
+                                            st.markdown(f"• {evidence}")
+                                
+                                if is_primary:
+                                    st.markdown("</div>", unsafe_allow_html=True)
+                                
+                                st.markdown("---")
+                            
+                            # Competing diagnosis note
+                            if json_data.get("competing_diagnosis_note"):
+                                st.info(f"💡 **Key Insight:** {json_data['competing_diagnosis_note']}")
+                    
                     # EVI Analysis
                     if json_data.get("evi_scores"):
                         with st.expander("📊 **Expected Value of Information (EVI) Analysis**", expanded=True):
                             st.markdown("*Which tests actually change management?*")
                             try:
+                                # Create enhanced table with differentiation info
+                                evi_data = json_data["evi_scores"]
                                 st.table({
-                                    "Test": [x.get("test","") for x in json_data["evi_scores"]],
-                                    "Changes Management?": [x.get("will_change_management","") for x in json_data["evi_scores"]],
-                                    "EVI Score": [f"{safe_float(x.get('evi', 0)):.3f}" for x in json_data["evi_scores"]],
+                                    "Test": [x.get("test","") for x in evi_data],
+                                    "Differentiates": [x.get("differentiates", "N/A") for x in evi_data],
+                                    "Changes Mgmt?": [x.get("will_change_management","") for x in evi_data],
+                                    "EVI Score": [f"{safe_float(x.get('evi', 0)):.3f}" for x in evi_data],
                                 })
                             except Exception as e:
                                 st.info("📊 EVI data available but formatting issue detected.")
                     
-                    # Test Costs - Show actual dollars
+                    # Test Costs - Show actual dollars and what they differentiate
                     if json_data.get("tests"):
-                        with st.expander("💰 **Test Costs**", expanded=True):
-                            st.markdown("*Resource stewardship analysis*")
+                        with st.expander("💰 **Test Costs & Purpose**", expanded=True):
+                            st.markdown("*Resource stewardship and diagnostic strategy*")
                             test_data = []
                             for test in json_data["tests"]:
                                 test_name = test.get("name", "")
                                 cost_dollars = test.get("cost_dollars", 0)
+                                differentiates = test.get("differentiates", "")
                                 
                                 # Get reference cost if not provided
                                 if cost_dollars == 0:
@@ -1318,15 +1452,15 @@ def process_case(user_query: str):
                                 
                                 test_data.append({
                                     "Test": test_name,
+                                    "Differentiates": differentiates if differentiates else "N/A",
                                     "Cost": f"${cost_dollars:,.0f}",
-                                    "Context": get_cost_info(test_name).get('note', '')
                                 })
                             
                             if test_data:
                                 st.table({
                                     "Test": [x["Test"] for x in test_data],
+                                    "Purpose": [x["Differentiates"] for x in test_data],
                                     "Cost": [x["Cost"] for x in test_data],
-                                    "Context": [x["Context"] for x in test_data],
                                 })
                     
                     # Action Plan - NEW!
